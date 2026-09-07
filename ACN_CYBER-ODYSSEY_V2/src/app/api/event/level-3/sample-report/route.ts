@@ -3,8 +3,8 @@ import { prisma } from '@/lib/prisma';
 import { getSessionUser } from '@/lib/auth/session';
 import { checkAuthoritativeLevelAccess } from '@/lib/event/level-access';
 import { getPublishedLevelResource } from '@/lib/event/level-resources';
-import * as fs from 'fs';
 import { resolveContainedPath, UPLOAD_ROOTS } from '@/lib/storage/safe-path';
+import { readObjectStream } from '@/lib/storage/object-store';
 
 /**
  * Authenticated stream for Level 3 Sample Report / Reference Rubric Template.
@@ -41,12 +41,14 @@ export async function GET() {
   // Query database for published sample report
   const resource = await getPublishedLevelResource(3, 'SAMPLE_REPORT');
 
-  // Containment check before touching the filesystem (SEC-17-03).
+  // Containment check on the stored path (SEC-17-03) — a pure string check,
+  // independent of whether the bytes live on local disk or in S3.
   const resolvedPath = resource
     ? resolveContainedPath(resource.storagePath, UPLOAD_ROOTS.resources)
     : null;
+  const fileStream = resolvedPath ? await readObjectStream(resource!.storagePath) : null;
 
-  if (!resource || !resolvedPath || !fs.existsSync(resolvedPath)) {
+  if (!resource || !resolvedPath || !fileStream) {
     return NextResponse.json(
       {
         error:
@@ -69,9 +71,6 @@ export async function GET() {
     })
     .catch(() => {});
 
-  const stats = fs.statSync(resolvedPath);
-  const fileStream = fs.createReadStream(resolvedPath);
-
   const stream = new ReadableStream({
     start(controller) {
       fileStream.on('data', (chunk) => {
@@ -90,7 +89,7 @@ export async function GET() {
     headers: {
       'Content-Type': resource.mimeType || 'application/pdf',
       'Content-Disposition': `attachment; filename="${encodeURIComponent(resource.originalName)}"`,
-      'Content-Length': stats.size.toString(),
+      'Content-Length': resource.fileSize.toString(),
       'Cache-Control': 'private, no-cache, no-store, must-revalidate',
     },
   });

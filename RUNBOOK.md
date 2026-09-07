@@ -308,3 +308,199 @@ The one thing to get right is that there are **two address spaces**:
 
 `NEXT_PUBLIC_PORTAL_BASE_URL` is inlined into Level 1's browser bundle at build
 time, so changing it needs a rebuild, not a restart.
+
+---
+
+## AWS deployment (ECS Fargate)
+
+Terraform for this lives under `infra/terraform/`. It provisions: a VPC (2
+public + 2 private subnets across 2 AZs), an ALB with host-based routing to
+two target groups, ECS Fargate running three services (Portal, Level 1, and
+the outbox drainer as its own service), one RDS PostgreSQL instance holding
+both databases, an S3 bucket for uploads, and Secrets Manager entries for
+every credential this document's "Required secrets" section lists. This is
+an alternative to the Docker Compose stack above, not a replacement — Compose
+remains the right tool for local development and a single-host event.
+
+**Why not just run docker-compose.yml on one EC2 instance?** You can — that
+is a legitimate, simpler option for 120-150 people, and RUNBOOK's own load
+figures (300 concurrent authenticated page loads, single instance: all waves
+pass) comfortably cover that scale. ECS Fargate is worth the extra setup if
+you want the load balancer's health-check-driven restarts, want to scale the
+Portal to 2+ instances without hand-managing a reverse proxy, or don't want
+to patch an EC2 host's OS yourself. Both are documented; pick one.
+
+### What changed in the app to make this safe
+
+Three things about the Compose model don't survive being split across
+independent Fargate tasks with no shared disk — see the code changes in
+`src/lib/storage/object-store.ts` and its callers:
+
+1. **Uploads move to S3.** Each Fargate task has its own ephemeral
+   filesystem; a submission file written by one Portal task would be
+   invisible to a request served by another. Setting `S3_BUCKET` switches
+   `saveSubmissionFile`, `discardSubmissionFiles`, `saveLevelResource`,
+   `removeLevelResource` and all five file-download routes from local disk to
+   S3. Unset (local dev, the test suite), behavior is byte-for-byte what it
+   was before — this is additive, not a rewrite.
+2. **Level 1 stays at exactly one task.** Its login throttler
+   (`lib/rateLimitStore.js`) is documented in its own file header as
+   per-process, in-memory state. A second replica would give every client
+   roughly 2x its intended attempt allowance. The Terraform fixes Level 1's
+   `desiredCount` at 1 with no autoscaling for exactly this reason. If Level
+   1 ever needs to scale, that file already specifies the Postgres-backed
+   store schema to implement first.
+3. **The outbox drainer is its own service**, not bundled into Level 1's
+   container command. `scripts/drain-outbox.js --watch` is a long-running
+   poll loop, not a request handler, and Fargate expects one process per
+   task. It runs from the same Level 1 image with the command overridden.
+
+### If your domain is NOT on Route 53
+
+`route53_zone_id` stays `""`, so Terraform won't touch DNS or issue a
+certificate for you. Get the certificate and the DNS records yourself, in
+this order — the certificate must exist and be **ISSUED** before
+`terraform apply`, because the ALB listener needs a real ARN, not a
+placeholder:
+
+```bash
+# 1. Request a certificate covering both hostnames, DNS-validated.
+aws acm request-certificate \
+  --domain-name odyssey.example.org \
+  --subject-alternative-names level1.odyssey.example.org \
+  --validation-method DNS \
+  --region <region>
+# Note the CertificateArn it returns.
+
+# 2. Get the validation CNAME records ACM wants you to create.
+aws acm describe-certificate --certificate-arn <arn-from-step-1> --region <region> \
+  --query 'Certificate.DomainValidationOptions[].ResourceRecord'
+# Prints one {Name, Type, Value} pair per hostname (two, here).
+
+# 3. Add BOTH as CNAME records at your registrar (GoDaddy, Namecheap, etc.) —
+#    not at AWS. This is the one manual DNS step Route 53 would have skipped.
+
+# 4. Wait for validation (can take a few minutes to ~30):
+aws acm wait certificate-validated --certificate-arn <arn-from-step-1> --region <region>
+```
+
+Once that returns, you have a real `acm_certificate_arn` for `terraform.tfvars`.
+
+**After `terraform apply` succeeds**, take the `alb_dns_name` output and add
+two more CNAME records at the same registrar — this is the step that
+actually sends traffic to the ALB:
+
+```
+odyssey.example.org           CNAME   <alb_dns_name>
+level1.odyssey.example.org    CNAME   <alb_dns_name>
+```
+
+(A bare apex domain, e.g. `example.org` with no subdomain, can't use CNAME at
+most registrars — this is why both hostnames here are subdomains.) DNS
+propagation is typically minutes, occasionally longer depending on the
+registrar and any previous record's TTL.
+
+### First-time deploy order
+
+```bash
+cd infra/terraform
+
+# 1. Create the state bucket + lock table by hand (see backend.tf), then:
+terraform init
+
+# 2. Provide the required variables — see variables.tf for the full list.
+#    At minimum: availability_zones, portal_domain_name, level1_domain_name,
+#    creator_email, and acm_certificate_arn (from the ACM walkthrough above,
+#    since route53_zone_id is blank without a Route 53 domain).
+terraform apply
+
+# 3. Build and push both images. NEXT_PUBLIC_PORTAL_BASE_URL is a Level 1
+#    BUILD argument (inlined into the browser bundle) — get the domain right
+#    here or it needs a rebuild, not a restart, to fix.
+aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+
+docker build -t <portal_ecr_repository_url>:latest ACN_CYBER-ODYSSEY_V2
+docker push <portal_ecr_repository_url>:latest
+
+docker build -t <level1_ecr_repository_url>:latest \
+  --build-arg NEXT_PUBLIC_PORTAL_BASE_URL=https://<portal_domain_name> \
+  "cyber-odyssey-app level-1"
+docker push <level1_ecr_repository_url>:latest
+
+# 4. Force both services to pick up the images just pushed (they were
+#    created against an empty repository, since the image can't exist before
+#    step 3).
+aws ecs update-service --cluster <cluster_name> --service <env>-portal --force-new-deployment
+aws ecs update-service --cluster <cluster_name> --service <env>-level1 --force-new-deployment
+
+# 5. Run migrations and seed the Portal as one-off tasks (same task
+#    definition, overridden command — same commands this document's Docker
+#    section already uses, just launched via run-task instead of a shell):
+aws ecs run-task --cluster <cluster_name> --launch-type FARGATE \
+  --task-definition <env>-portal \
+  --network-configuration "awsvpcConfiguration={subnets=[<private_subnet_ids>],securityGroups=[<ecs_security_group_id>],assignPublicIp=DISABLED}" \
+  --overrides '{"containerOverrides":[{"name":"portal","command":["node","node_modules/prisma/build/index.js","migrate","deploy"]}]}'
+
+# CREATOR_PASSWORD for this comes from Secrets Manager, not a value you choose:
+aws secretsmanager get-secret-value --secret-id <env>/creator-password --query SecretString --output text
+# Then run db:seed the same way, with that value and CREATOR_EMAIL passed as
+# a plaintext environment override (CREATOR_PASSWORD is read only by this
+# one-off command, never by the running service).
+```
+
+### Level 1's team-codes.csv
+
+`npm run db:seed` on Level 1 regenerates every crew's password and writes
+`team-codes.csv` to the container's local disk — deliberately not S3, since
+it's a one-time operator artifact, not application state. On Fargate that
+disk disappears with the task. Retrieve the file **immediately** after
+running the seed task, before the task stops:
+
+```bash
+aws ecs execute-command --cluster <cluster_name> --task <task_arn> \
+  --container level1 --interactive --command "cat team-codes.csv"
+```
+
+(Requires `enableExecuteCommand` on the task/service and the SSM Session
+Manager plugin locally.) Copy the output out immediately — there is no
+second chance once the task stops.
+
+### Verifying capacity on the real infrastructure
+
+RUNBOOK's load figures above are real, but they were run against a bare
+process on localhost, not through an ALB, TLS termination and Fargate's own
+network path. Before opening this to participants:
+
+```bash
+# Point the existing scripts at the live ALB URL instead of localhost.
+PORTAL_BASE_URL=https://<portal_domain_name> npm run load:scenarios
+PORTAL_BASE_URL=https://<portal_domain_name> npm run load:http
+```
+
+and run Level 1's `npm run test:scale` the same way. Also do a manual
+browser smoke test of Creator → Admin → Evaluator → Participant end to end —
+neither this Terraform nor the existing test suite has ever driven a real
+browser against this app (see `docs/production-readiness.md` §17).
+
+### Operational notes specific to this infrastructure
+
+- **RDS is not internet-reachable, by design.** The second database
+  (`odyssey_portal`) is bootstrapped by a one-off ECS task inside the VPC
+  (`modules/database/main.tf`), not by a `psql` client on your laptop —
+  avoids ever putting a security-group hole in front of the database for a
+  one-time setup step.
+- **Divide the connection pool as documented above.** The Portal's
+  `DATABASE_URL` secret is generated with `connection_limit=40`; at
+  `portal_desired_count = 2` that's 80 connections, well inside a
+  `db.t4g.medium`'s ~450 `max_connections`, with headroom for Level 1, the
+  outbox drainer, and manual `psql` access during the event.
+- **`TRUST_PROXY=1` is set on Level 1's task definition, deliberately.** The
+  app's own comment on that variable warns against setting it unless a real
+  proxy in front overwrites `X-Forwarded-For` — the ALB does exactly that, so
+  this is the correct setting here, not an exception to the warning. Leaving
+  it unset behind the ALB would key the login throttler on the ALB's own
+  address for every participant, which silently defeats it.
+- **Level 1's server-to-server calls to the Portal go over the public ALB
+  URL**, not an internal service name — Fargate has no equivalent of
+  Compose's internal DNS without adding ECS Service Connect or Cloud Map.
+  Fine at this scale; worth revisiting if traffic between the two grows.

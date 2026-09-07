@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import { getSessionUser } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
-import * as fs from 'fs';
 import { resolveContainedPath, UPLOAD_ROOTS } from '@/lib/storage/safe-path';
+import { readObjectStream } from '@/lib/storage/object-store';
 
 interface RouteContext {
   params: Promise<{ id: string }>;
@@ -60,9 +60,11 @@ export async function GET(_request: Request, context: RouteContext) {
       return NextResponse.json({ error: 'Deliverable file record not found.' }, { status: 404 });
     }
 
-    // Containment check: the file must resolve strictly inside uploads/submissions.
-    // See src/lib/storage/safe-path.ts for why the previous startsWith check was
-    // insufficient (SEC-17-03).
+    // Containment check: the stored path must resolve strictly inside
+    // uploads/submissions. See src/lib/storage/safe-path.ts for why the
+    // previous startsWith check was insufficient (SEC-17-03). This is a pure
+    // string check — it runs the same way whether the bytes actually live on
+    // local disk or in S3 (see object-store.ts).
     const resolvedPath = resolveContainedPath(fileRecord.storagePath, UPLOAD_ROOTS.submissions);
 
     if (!resolvedPath) {
@@ -75,7 +77,9 @@ export async function GET(_request: Request, context: RouteContext) {
       );
     }
 
-    if (!fs.existsSync(resolvedPath)) {
+    const fileStream = await readObjectStream(fileRecord.storagePath);
+
+    if (!fileStream) {
       return NextResponse.json(
         { error: 'File deliverable is missing from physical storage repository.' },
         { status: 404 },
@@ -93,9 +97,6 @@ export async function GET(_request: Request, context: RouteContext) {
         },
       })
       .catch(() => {});
-
-    const stats = fs.statSync(resolvedPath);
-    const fileStream = fs.createReadStream(resolvedPath);
 
     const stream = new ReadableStream({
       start(controller) {
@@ -117,7 +118,7 @@ export async function GET(_request: Request, context: RouteContext) {
       headers: {
         'Content-Type': fileRecord.mimeType || 'application/octet-stream',
         'Content-Disposition': `attachment; filename="${safeFilename}"`,
-        'Content-Length': stats.size.toString(),
+        'Content-Length': fileRecord.fileSize.toString(),
         'Cache-Control': 'private, no-cache, no-store, must-revalidate',
       },
     });

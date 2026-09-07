@@ -1,6 +1,6 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { writeObject, deleteObject } from './object-store';
 
 export const MAX_SUBMISSION_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
 
@@ -101,16 +101,7 @@ export function discardSubmissionFiles<T extends { storagePath: string }>(files:
   // Pick<> so a full SavedSubmissionFile literal still passes without tripping
   // excess-property checking.
   for (const file of files) {
-    try {
-      const resolved = path.isAbsolute(file.storagePath)
-        ? file.storagePath
-        : path.resolve(process.cwd(), file.storagePath);
-      if (fs.existsSync(resolved)) {
-        fs.unlinkSync(resolved);
-      }
-    } catch {
-      // Best-effort cleanup; never throw from a rollback path.
-    }
+    deleteObject(file.storagePath);
   }
 }
 
@@ -189,22 +180,19 @@ export async function saveSubmissionFile(
   const uniqueToken = crypto.randomBytes(8).toString('hex');
   const safeFileName = `lvl${level}_${teamId.slice(0, 8)}_${uniqueToken}_${safeBaseName}`;
 
-  const targetDir = path.join(process.cwd(), 'uploads', 'submissions', `level-${level}`);
-  if (!fs.existsSync(targetDir)) {
-    fs.mkdirSync(targetDir, { recursive: true });
-  }
+  const targetDir = path.join('uploads', 'submissions', `level-${level}`);
+  const storagePath = path.join(targetDir, safeFileName);
 
-  const fullPath = path.join(targetDir, safeFileName);
-
-  // 5. Write file buffer safely without executing
-  await fs.promises.writeFile(fullPath, buffer);
+  // 5. Write file buffer safely without executing. Local disk or S3 —
+  // see src/lib/storage/object-store.ts.
+  await writeObject(storagePath, buffer);
 
   return {
     valid: true,
     file: {
       originalName: rawOriginalName,
       fileName: safeFileName,
-      storagePath: path.relative(process.cwd(), fullPath),
+      storagePath,
       fileSize: file.size,
       mimeType: file.type || 'application/octet-stream',
     },

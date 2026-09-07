@@ -1,7 +1,7 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { prisma } from '@/lib/prisma';
+import { writeObject, deleteObject } from '@/lib/storage/object-store';
 
 export interface LevelResourceMeta {
   id: string;
@@ -54,14 +54,11 @@ export const LEVEL_RESOURCE_CONFIG: Record<
 };
 
 /**
- * Returns absolute storage directory for a specific level's resources.
+ * Returns the storage directory (relative to the uploads root — see
+ * src/lib/storage/object-store.ts) for a specific level's resources.
  */
 export function getLevelResourceDir(levelNumber: number = 2): string {
-  const dir = path.join(process.cwd(), 'uploads', 'resources', `level-${levelNumber}`);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  return dir;
+  return path.join('uploads', 'resources', `level-${levelNumber}`);
 }
 
 /**
@@ -126,11 +123,10 @@ export async function getPublishedLevelResource(
     return null;
   }
 
-  // Ensure file physically exists on disk
-  if (!fs.existsSync(record.storagePath)) {
-    return null;
-  }
-
+  // Whether the bytes actually exist (local disk or S3) is checked by the
+  // caller when it streams the file — see object-store.ts's readObjectStream,
+  // which returns null on a miss. Checking here too would mean checking
+  // twice, and on S3 that's a second network round trip for no benefit.
   return {
     id: record.id,
     levelNumber: record.levelNumber,
@@ -225,6 +221,10 @@ export async function saveLevelResource({
   const resourceDir = getLevelResourceDir(levelNumber);
   const storageFileName = `lvl${levelNumber}_${resourceKey.toLowerCase()}_${Date.now()}_${randomUUID().slice(0, 8)}${ext}`;
   const targetStoragePath = path.join(resourceDir, storageFileName);
+  // Relative to the uploads root, matching submission-storage.ts's convention.
+  // A previous version of this function stored an absolute path, which broke
+  // if the deployment directory ever moved — see the Phase 17 audit's
+  // "Absolute storagePath for resources" finding.
 
   // Check for existing record
   const existing = await prisma.levelResource.findUnique({
@@ -249,7 +249,7 @@ export async function saveLevelResource({
     );
   }
 
-  fs.writeFileSync(targetStoragePath, buffer);
+  await writeObject(targetStoragePath, buffer);
 
   // Upsert record atomically
   const updated = await prisma.levelResource.upsert({
@@ -283,13 +283,9 @@ export async function saveLevelResource({
     },
   });
 
-  // Clean up old file from disk if replaced
-  if (oldStoragePath && oldStoragePath !== targetStoragePath && fs.existsSync(oldStoragePath)) {
-    try {
-      fs.unlinkSync(oldStoragePath);
-    } catch {
-      // Ignore disk cleanup error if file was missing
-    }
+  // Clean up the old file if this was a replace, not a first upload.
+  if (oldStoragePath && oldStoragePath !== targetStoragePath) {
+    deleteObject(oldStoragePath);
   }
 
   // Create Audit Log
@@ -358,13 +354,8 @@ export async function removeLevelResource({
     },
   });
 
-  // Safely delete file from disk
-  if (existing.storagePath && fs.existsSync(existing.storagePath)) {
-    try {
-      fs.unlinkSync(existing.storagePath);
-    } catch {
-      // Ignore disk unlink errors
-    }
+  if (existing.storagePath) {
+    deleteObject(existing.storagePath);
   }
 
   // Create Audit Log
