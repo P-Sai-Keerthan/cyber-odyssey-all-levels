@@ -1,0 +1,157 @@
+# ACN Cyber Odyssey — full event stack.
+#
+#   docker compose up -d --build
+#
+# ---------------------------------------------------------------------------
+# THE TWO ADDRESS SPACES
+# ---------------------------------------------------------------------------
+# This is the thing that breaks first when these applications are containerised,
+# so it is stated once, here:
+#
+#   SERVER-TO-SERVER  -> the compose service name.  http://portal:3002
+#     Used by Level 1 to redeem a ticket and to report a score. Resolves only
+#     inside the Docker network.
+#
+#   BROWSER-FACING    -> the address a PARTICIPANT types.  http://localhost:3002
+#     Used for "Enter Level 1" and "Return to Portal". A service name here is a
+#     link that resolves on the server and nowhere the participant can reach.
+#
+# `PORTAL_BASE_URL` is the first kind. `NEXT_PUBLIC_PORTAL_BASE_URL` and
+# `LEVEL1_CHALLENGE_URL` are the second. Getting them the wrong way round
+# produces an integration that passes every server-side test and sends every
+# participant to a dead link.
+#
+# For a real deployment replace the PUBLIC_* values with the host's real origin.
+#
+# ---------------------------------------------------------------------------
+# SECRETS
+# ---------------------------------------------------------------------------
+# Nothing is baked into an image. Every secret arrives at runtime from
+# .env.docker (git-ignored; see .env.docker.example). The only build argument is
+# the public Portal URL, which is not a secret and cannot be anything else —
+# Next inlines NEXT_PUBLIC_* into the browser bundle at build time.
+
+name: cyber-odyssey
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — now shared by BOTH applications, each with its own database.
+  #
+  # The Portal moved off SQLite for the event: SQLite admits one writer at a
+  # time, and 100 squads scoring inside the same minutes is a write-concurrency
+  # problem it cannot solve. Two databases on one server rather than two servers
+  # — they are the same operational unit, backed up and restored together.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-odyssey}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # The Level 1 database. The Portal's is created by the init script below.
+      POSTGRES_DB: ${POSTGRES_DB:-cyber_odyssey}
+    volumes:
+      - level1-db:/var/lib/postgresql/data
+      # Runs ONCE, on an empty data directory, to add the Portal's database
+      # beside Level 1's. Creating it here rather than in the Portal's start
+      # command keeps `migrate deploy` a pure schema step with nothing to guess
+      # about privileges.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    # Bound to loopback: the database is reachable from the host for
+    # administration, never from the venue network.
+    ports:
+      # Host port is configurable so the stack can run alongside another
+      # Postgres during testing without a bind conflict.
+      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+    healthcheck:
+      # Level 1 must not start against a database that is still initialising —
+      # its first query would fail and the container would restart-loop.
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-odyssey} -d ${POSTGRES_DB:-cyber_odyssey}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Main Portal — participant, creator, evaluator and admin surfaces.
+  # ---------------------------------------------------------------------------
+  portal:
+    build:
+      context: ./ACN_CYBER-ODYSSEY_V2
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # PostgreSQL, by SERVICE NAME. `connection_limit` bounds this container's
+      # pool; `pool_timeout` makes a starved request fail rather than hang.
+      DATABASE_URL: 'postgresql://${POSTGRES_USER:-odyssey}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${PORTAL_DB:-odyssey_portal}?schema=public&connection_limit=20&pool_timeout=20&connect_timeout=10'
+
+      # Bootstrap creator, consumed only by `npm run db:seed`.
+      CREATOR_EMAIL: ${CREATOR_EMAIL:-}
+      CREATOR_PASSWORD: ${CREATOR_PASSWORD:-}
+      CREATOR_USERNAME: ${CREATOR_USERNAME:-}
+
+      # Level 1 bridge. Must equal ODYSSEY_LEVEL1_SECRET on the level1 service.
+      ODYSSEY_LEVEL1_SECRET: ${ODYSSEY_LEVEL1_SECRET:?ODYSSEY_LEVEL1_SECRET is required}
+      # BROWSER-FACING: where "Enter Level 1" sends a participant.
+      LEVEL1_CHALLENGE_URL: ${PUBLIC_LEVEL1_URL:-http://localhost:3001}
+
+      # ORION Level 3 bridge. Optional — unset disables it (endpoints answer 503
+      # rather than accepting unsigned events).
+      ODYSSEY_INTEGRATION_SECRET: ${ODYSSEY_INTEGRATION_SECRET:-}
+      LEVEL3_CHALLENGE_URL: ${LEVEL3_CHALLENGE_URL:-}
+    volumes:
+      # Submitted deliverables. The database lives in PostgreSQL now, so there is
+      # no SQLite file to persist — only participant uploads.
+      - portal-uploads:/app/uploads
+    ports:
+      - '${PORTAL_PORT:-3002}:3002'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3002/login >/dev/null 2>&1 || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Level 1 challenge application.
+  # ---------------------------------------------------------------------------
+  level1:
+    build:
+      context: ./cyber-odyssey-app level-1
+      args:
+        # Build-time because Next inlines it into the browser bundle. Changing
+        # it requires a rebuild, not a restart.
+        NEXT_PUBLIC_PORTAL_BASE_URL: ${PUBLIC_PORTAL_URL:-http://localhost:3002}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: 'postgresql://${POSTGRES_USER:-odyssey}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-cyber_odyssey}'
+
+      # Signs every team AND admin cookie. Level 1 refuses to start a session
+      # without one outside development — see lib/sessionSecret.js.
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      # No default anywhere. Unset means admin sign-in answers 503.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+
+      # SERVER-TO-SERVER: the compose service name, not a public URL.
+      PORTAL_BASE_URL: 'http://portal:3002'
+      ODYSSEY_LEVEL1_SECRET: ${ODYSSEY_LEVEL1_SECRET:?ODYSSEY_LEVEL1_SECRET is required}
+    ports:
+      - '${LEVEL1_PORT:-3001}:3001'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3001/api/event/status >/dev/null 2>&1 || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  # Named, so replacing a container never loses the event.
+  level1-db:
+  portal-uploads:

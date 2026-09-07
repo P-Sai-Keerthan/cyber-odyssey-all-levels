@@ -1,0 +1,994 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // PostgreSQL for the event.
+  //
+  // SQLite admits exactly ONE writer at a time. WAL and a raised busy_timeout
+  // lifted that ceiling far enough for a rehearsal, but 100 squads submitting
+  // and scoring inside the same minutes is a write-concurrency problem SQLite
+  // cannot solve — every interactive transaction serialises behind one lock.
+  //
+  // The schema itself was already portable: no native column types, no enums,
+  // no Json/Bytes/Decimal, so this is a datasource change rather than a data
+  // model change. The SQLite migration history is retired under
+  // prisma/migrations-sqlite-archive/ — a Prisma migration directory is
+  // provider-specific and that history is written in SQLite dialect.
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model PreRegisteredParticipant {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+}
+
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique
+  username         String    @unique
+  passwordHash     String
+  role             String    @default("PARTICIPANT") // PARTICIPANT, EVALUATOR, ADMIN, CREATOR
+  status           String    @default("ACTIVE") // ACTIVE, PENDING_APPROVAL, REJECTED, SUSPENDED, BLOCKED
+  lastLoginAt      DateTime?
+  lastLogoutAt     DateTime?
+  lastActivityAt   DateTime?
+  loginCount       Int       @default(0)
+  failedLoginCount Int       @default(0)
+
+  /// Absolute expiry of a brute-force lockout, or null when not locked
+  /// (Phase 17 / SEC-17-02).
+  ///
+  /// The lockout window was previously derived from `lastActivityAt`, which is
+  /// also refreshed by ordinary session activity. That made the lock renew itself
+  /// every time the victim loaded a page: an attacker could permanently lock any
+  /// account out of the event with ten wrong guesses. An explicit expiry stamped
+  /// once, at the moment the threshold is crossed, cannot be extended by the
+  /// victim's own behaviour.
+  lockedUntil          DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  membership           TeamMember?
+  sessions             Session[]
+  targetLogs           AuditLog[]        @relation("TargetUser")
+  actorLogs            AuditLog[]        @relation("ActorUser")
+  submissions          Submission[]
+  evaluations          Evaluation[]
+  notifications        Notification[]
+  authoredReports      CreatorReport[]   @relation("ReportAuthor")
+  reportedIn           CreatorReport[]   @relation("ReportTargetUser")
+  level3Finds          Level3Discovery[]
+  level3Penalties      Level3Penalty[]
+  requestedAdjustments ScoreAdjustment[] @relation("ScoreAdjustmentRequestedBy")
+  reviewedAdjustments  ScoreAdjustment[] @relation("ScoreAdjustmentReviewedBy")
+
+  // Creator/Admin account governance filters by role+status together
+  // (pending-approval queues, evaluator/admin rosters, active-account counts).
+  @@index([role, status])
+  // Standalone status counts (active / blocked / pending totals on both overviews).
+  @@index([status])
+  // Account lists are ordered by createdAt desc and paginated.
+  @@index([createdAt])
+}
+
+model Team {
+  id           String @id @default(cuid())
+  name         String @unique
+  code         String @unique
+  passwordHash String
+  creatorId    String
+  score        Int    @default(0)
+  status       String @default("ACTIVE") // ACTIVE, DISQUALIFIED, BLOCKED
+
+  /// Stable, non-secret identifier shared with EVERY external challenge
+  /// application — ORION Level 3 and the Level 1 application both.
+  ///
+  /// Deliberately NOT `Team.code` — that is the private join code, and handing it
+  /// to a second system would turn a squad-membership secret into an integration
+  /// identifier printed in logs on both sides. This value carries no authority by
+  /// itself: it names a squad, it does not authenticate one. The HMAC on the
+  /// integration request is what establishes that the external system really sent
+  /// the event.
+  ///
+  /// ONE reference serves both bridges rather than one per level. A squad has a
+  /// single identity in this event; giving it a second name per external system
+  /// would mean two things to keep in step and two ways for them to disagree.
+  ///
+  /// Still nullable at the database level so the column can be added to a live
+  /// database without rewriting every row in the same statement, and so a squad
+  /// created before the backfill is never rejected outright. Every write path
+  /// populates it — see `createTeamAction` — and the backfill migration fills in
+  /// the existing rows, so in practice it is never null after deployment.
+  externalRef      String?             @unique
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  members          TeamMember[]
+  submissions      Submission[]
+  evaluations      Evaluation[]
+  reports          CreatorReport[]
+  level3Finds      Level3Discovery[]
+  level3Penalties  Level3Penalty[]
+  level1Results    Level1Result[]
+  level1Penalties  Level1Penalty[]
+  level1Tickets    IntegrationTicket[]
+  scoreAdjustments ScoreAdjustment[]
+
+  // Dashboard rank query: count(score > myScore).
+  @@index([score, updatedAt])
+  // Leaderboard: where status = ACTIVE order by score desc, updatedAt asc.
+  @@index([status, score])
+  // Creator/Admin squad registry: order by createdAt desc, paginated.
+  @@index([createdAt])
+}
+
+model TeamMember {
+  id     String @id @default(cuid())
+  teamId String
+  // userId is @unique: a participant can hold membership in exactly one squad.
+  // This is what makes concurrent "join two teams at once" impossible.
+  userId String @unique
+
+  /// Roster slot, 1..MAX_TEAM_SIZE (3). Combined with @@unique([teamId, slot])
+  /// this is what makes team over-capacity impossible at the DATABASE level
+  /// (Phase 17 / DB-17-03).
+  ///
+  /// Previously capacity was enforced by counting rows inside a transaction and
+  /// re-checking afterwards. That is correct under SQLite (which serialises
+  /// writers) but races under any MVCC engine: two concurrent transactions both
+  /// read count=2, both insert, and the team ends up with 4 members.
+  ///
+  /// With a slot, two racing joiners that pick the same slot collide on the
+  /// unique index — one commits, the other gets P2002 and retries into the next
+  /// free slot, or is told the squad is full. There is no interleaving in which
+  /// a fourth member acquires a slot.
+  slot     Int      @default(1)
+  role     String   @default("MEMBER")
+  joinedAt DateTime @default(now())
+  team     Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, slot])
+  @@index([teamId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  // Active-session counts and the Creator session monitor filter on expiry.
+  // Also serves the expired-session reaper.
+  @@index([expiresAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  targetId  String?
+  action    String // ADMIN_LOGIN, ADMIN_LOGOUT, LEVEL_STARTED, LEVEL_PAUSED, LEVEL_RESUMED, LEVEL_STOPPED, LEVEL_COMPLETED, LEVEL_RESET, PORTAL_ONLINE, PORTAL_OFFLINE, ANNOUNCEMENT_CREATED, ANNOUNCEMENT_PUBLISHED, etc.
+  details   String?
+  createdAt DateTime @default(now())
+  actor     User?    @relation("ActorUser", fields: [actorId], references: [id], onDelete: SetNull)
+  target    User?    @relation("TargetUser", fields: [targetId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([targetId])
+  @@index([action, createdAt])
+  @@index([createdAt])
+}
+
+model PortalSetting {
+  id        String   @id @default("default")
+  isOnline  Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+  updatedBy String?
+}
+
+model LevelState {
+  id               String    @id @default(cuid())
+  levelNumber      Int       @unique // 1, 2, 3
+  name             String
+  codename         String
+  status           String    @default("LOCKED") // LOCKED, READY, LIVE, PAUSED, COMPLETED
+  maxScore         Int       @default(1000) // Configuration-driven maximum score for the level
+  durationMinutes  Int       @default(60)
+  durationSeconds  Int       @default(3600)
+  remainingSeconds Int       @default(3600)
+  startedAt        DateTime?
+  pausedAt         DateTime?
+  endsAt           DateTime?
+  completedAt      DateTime?
+  updatedAt        DateTime  @updatedAt
+
+  @@index([status])
+}
+
+model Announcement {
+  id             String         @id @default(cuid())
+  title          String
+  content        String
+  category       String         @default("GENERAL") // GENERAL, SYSTEM, MISSION, URGENT
+  priority       String         @default("NORMAL") // LOW, NORMAL, HIGH, URGENT
+  targetAudience String         @default("ALL") // ALL, PARTICIPANTS, EVALUATORS, ADMINS, LEVEL_1, LEVEL_2, LEVEL_3
+  levelNumber    Int?
+  createdBy      String?
+  published      Boolean        @default(true)
+  publishedAt    DateTime?      @default(now())
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  notifications  Notification[]
+
+  @@index([published, createdAt])
+  @@index([targetAudience])
+  // Participant-visible feed and badge counts:
+  // where published = true and targetAudience in (...) order by createdAt desc.
+  @@index([published, targetAudience, createdAt])
+}
+
+model Notification {
+  id             String        @id @default(cuid())
+  userId         String
+  announcementId String?
+  title          String
+  message        String
+  read           Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  announcement   Announcement? @relation(fields: [announcementId], references: [id], onDelete: SetNull)
+
+  @@index([userId, read])
+  @@index([announcementId])
+  // Per-user notification feed, newest first.
+  @@index([userId, createdAt])
+}
+
+model Submission {
+  id      String  @id @default(cuid())
+  teamId  String
+  userId  String
+  level   Int     @default(2) // 1, 2, 3
+  status  String  @default("SUBMITTED") // DRAFT, SUBMITTED, UNDER_REVIEW, ACCEPTED, REJECTED
+  answers String? // JSON stringified structured answers
+
+  /// How many times this squad has submitted for this level.
+  ///
+  /// The Submission row is always the CURRENT submission — that is the whole
+  /// point of the unique index below, and it is what the evaluator queue and the
+  /// leaderboard read. This counter exists so "current" can be stated rather
+  /// than assumed: the attempt whose `attemptNumber` equals this value is the one
+  /// being judged, and every lower-numbered attempt in `attempts` is history.
+  attemptCount Int @default(1)
+
+  submittedAt DateTime            @default(now())
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  files       SubmissionFile[]
+  attempts    SubmissionAttempt[]
+  evaluation  Evaluation?
+  team        Team                @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // INTEGRITY (Phase 17 / DB-17-01): a squad may hold at most ONE submission per
+  // level. Previously this was enforced only by a read-then-write check inside a
+  // transaction, which is safe under SQLite's serialized writer but races under
+  // any MVCC engine. The database now rejects the duplicate outright.
+  // This unique index also serves the (teamId, level) lookup the old index covered.
+  @@unique([teamId, level])
+  @@index([userId])
+  @@index([status])
+  // Evaluator and Admin submission queues filter by level+status.
+  @@index([level, status])
+  // Both queues order by submittedAt desc.
+  @@index([submittedAt])
+}
+
+/// One recorded attempt at a level's submission.
+///
+/// WHY THIS EXISTS
+/// ---------------
+/// A squad may resubmit as often as it likes before the deadline, and each
+/// resubmission REPLACES the `Submission` row's answers and files. Without this
+/// table the portal would keep no evidence that an earlier version ever existed:
+/// if a squad claims it submitted the right answer at 12:40 and the current row
+/// says otherwise, there is nothing to check.
+///
+/// Deliberately NOT a second submission-of-record. `Submission` stays the single
+/// current submission per (team, level) — the evaluator queue, the approval
+/// workflow and the leaderboard all read it and are untouched by this table.
+/// This is an append-only audit trail beside it.
+///
+/// Files are recorded as a MANIFEST (name, size, type) rather than by keeping the
+/// bytes of every superseded upload. Twenty megabytes per file, several files per
+/// attempt, several attempts per squad across fifty squads is tens of gigabytes to
+/// preserve versions nobody judges. The manifest answers "what did they have
+/// attached at 12:40" without that cost.
+model SubmissionAttempt {
+  id            String  @id @default(cuid())
+  submissionId  String
+  teamId        String
+  level         Int
+  /// 1-based, contiguous per submission. The attempt whose number equals
+  /// `Submission.attemptCount` is the CURRENT one.
+  attemptNumber Int
+  /// Submission status recorded at the moment this attempt was made.
+  status        String  @default("SUBMITTED")
+  /// JSON stringified answers as submitted for THIS attempt.
+  answers       String?
+  /// JSON array of { originalName, fileSize, mimeType } as attached for THIS attempt.
+  fileManifest  String  @default("[]")
+  /// Participant who made this attempt. Not a relation: a squad member removed
+  /// from the event should not cascade-delete the record that they submitted.
+  submittedById String
+
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  submission Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  // Attempt numbers are unique per submission, so a lost race cannot produce two
+  // "attempt 3" rows.
+  @@unique([submissionId, attemptNumber])
+  @@index([teamId, level])
+  @@index([submissionId, createdAt])
+}
+
+model SubmissionFile {
+  id           String     @id @default(cuid())
+  submissionId String
+  fileName     String
+  originalName String
+  fileSize     Int
+  mimeType     String
+  storagePath  String
+  createdAt    DateTime   @default(now())
+  submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  @@index([submissionId])
+}
+
+model Evaluation {
+  id           String  @id @default(cuid())
+  submissionId String  @unique
+  evaluatorId  String
+  teamId       String
+  level        Int     @default(2) // 1, 2, 3
+  status       String  @default("PENDING") // PENDING, IN_REVIEW, EVALUATED, RETURNED
+  score        Int     @default(0)
+  maxScore     Int     @default(1000)
+  criteria     String? // JSON string of criteria breakdown: [{ id, name, maxMarks, awardedMarks, feedback }]
+  notes        String? // Internal evaluator investigation notes
+  feedback     String? // Feedback/remarks for the team
+  version      Int     @default(1) // Optimistic concurrency lock
+
+  /// Admin approval gate (Roles phase / EVAL-01).
+  ///
+  /// PENDING_APPROVAL — evaluator has submitted; awaiting Admin review.
+  /// APPROVED         — Admin accepted. ONLY this state contributes to the
+  ///                    official leaderboard.
+  /// REJECTED         — Admin returned it for correction. Never scores.
+  /// NOT_SUBMITTED    — still a draft in the evaluator's hands.
+  ///
+  /// The leaderboard reads Team.score, and Team.score is recomputed as the sum of
+  /// APPROVED evaluations only. A pending or rejected score therefore cannot
+  /// reach the rankings even if a client claims otherwise — the aggregation
+  /// happens server-side inside the same transaction as the status change.
+  approvalStatus  String    @default("NOT_SUBMITTED")
+  approvedById    String?
+  approvedAt      DateTime?
+  rejectedById    String?
+  rejectedAt      DateTime?
+  /// Required when rejecting; shown to the evaluator so they can correct.
+  rejectionReason String?
+
+  startedAt   DateTime?
+  submittedAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  submission  Submission        @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  evaluator   User              @relation(fields: [evaluatorId], references: [id], onDelete: Cascade)
+  team        Team              @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  scores      EvaluationScore[]
+
+  @@index([evaluatorId])
+  @@index([teamId, level])
+  @@index([status])
+  // Atomic team-score aggregation: sum(score) where teamId = ? and status = 'EVALUATED'.
+  // This is on the write path of every evaluation save, so it must be indexed.
+  @@index([teamId, status])
+  // Admin evaluation monitor filters by status+level and orders by updatedAt desc.
+  @@index([status, level])
+  @@index([updatedAt])
+  // Leaderboard aggregation: sum(score) where teamId = ? and approvalStatus = 'APPROVED'.
+  // This is on the write path of every approval, so it must be indexed.
+  @@index([teamId, approvalStatus])
+  // Admin approval queue: filter by approval state, order by submission time.
+  @@index([approvalStatus, submittedAt])
+}
+
+/// Dynamic evaluation criteria configured per evaluable level (Level 2, Level 3, etc.)
+model EvaluationCriterion {
+  id          String @id @default(cuid())
+  levelNumber Int // 2, 3, etc.
+
+  /// Stable machine identity for a criterion whose value something OUTSIDE the
+  /// evaluator console has to read — e.g. Level 3's REPORT and RESPONSE, which
+  /// the participant page displays as named figures.
+  ///
+  /// Optional, because most criteria are free-form and are only ever addressed
+  /// by a human reading their title. A key exists so those few can be resolved
+  /// EXACTLY: matching on `title` would silently break the participant's scoring
+  /// panel the first time an Admin rewords a criterion, which is a change they
+  /// are entitled to make and would have no reason to connect to the breakage.
+  ///
+  /// Unique per level. NULLs do not collide in PostgreSQL, so unkeyed criteria
+  /// are unaffected.
+  key         String?
+  title       String
+  description String?
+  maxPoints   Int      @default(250)
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  guidance    String? // Confidential evaluator guidance/instructions
+  required    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  scores EvaluationScore[]
+
+  @@unique([levelNumber, key])
+  @@index([levelNumber, isActive, sortOrder])
+  @@index([levelNumber, sortOrder])
+}
+
+/// Normalized per-criterion score recorded for an evaluation
+model EvaluationScore {
+  id           String   @id @default(cuid())
+  evaluationId String
+  criterionId  String
+  awardedScore Int      @default(0)
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  evaluation Evaluation          @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+  criterion  EvaluationCriterion @relation(fields: [criterionId], references: [id], onDelete: Cascade)
+
+  @@unique([evaluationId, criterionId])
+  @@index([evaluationId])
+  @@index([criterionId])
+}
+
+/// Admin → Creator issue report (Admin spec §5).
+///
+/// Deliberately a small, purpose-built record rather than a reuse of
+/// Announcement: an announcement is a one-way broadcast with no subject and no
+/// lifecycle, whereas a report is addressed at a specific team or participant and
+/// has an open/resolved state the Creator works through. Overloading Announcement
+/// would have meant adding a nullable teamId, a nullable participantId and a
+/// status to a model that 210 participants read on every page.
+model CreatorReport {
+  id             String    @id @default(cuid())
+  /// Admin who raised the report.
+  authorId       String
+  /// Subject of the report — at least one of these is set.
+  teamId         String?
+  targetUserId   String?
+  issueType      String // TEAM_CONDUCT, PARTICIPANT_CONDUCT, TECHNICAL, SUBMISSION, OTHER
+  description    String
+  status         String    @default("OPEN") // OPEN, ACKNOWLEDGED, RESOLVED
+  resolvedById   String?
+  resolvedAt     DateTime?
+  resolutionNote String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  author     User  @relation("ReportAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  targetUser User? @relation("ReportTargetUser", fields: [targetUserId], references: [id], onDelete: SetNull)
+  team       Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
+
+  // Creator inbox: open reports first, newest first.
+  @@index([status, createdAt])
+  @@index([authorId])
+  @@index([teamId])
+}
+
+model LevelResource {
+  id           String   @id @default(cuid())
+  levelNumber  Int      @default(2) // 1, 2, 3
+  resourceKey  String // "EVIDENCE_PACKAGE", "SAMPLE_REPORT"
+  title        String // "Evidence Package", "Sample Investigation Report"
+  fileName     String // Sanitized internal stored filename
+  originalName String // Uploaded original filename
+  storagePath  String // Server disk storage path
+  fileSize     Int // Size in bytes
+  mimeType     String // "application/zip", "application/pdf"
+  isPublished  Boolean  @default(true)
+  uploadedById String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([levelNumber, resourceKey])
+  @@index([levelNumber, isPublished])
+}
+
+/// Level 3 vulnerability definition — one row per intentional bug planted in the
+/// Level 3 challenge site.
+///
+/// The flag is stored ONLY as `salt:sha256hex`. Nothing in this table lets a
+/// reader recover the answer, so a database leak (or an over-broad Creator query)
+/// does not hand out the challenge.
+model Level3Bug {
+  id   String @id @default(cuid())
+  /// Short public identifier shown in the participant sidebar, e.g. "01".
+  code String @unique
+
+  /// The challenge id used by the external ORION application, e.g. "1" or "t2_05".
+  /// This is the join key for inbound discovery events. It is separate from `code`
+  /// so the participant-facing label can be renumbered without invalidating the
+  /// integration, and so a bug can exist here with no ORION counterpart.
+  externalRef String? @unique
+  title       String
+  category    String  @default("WEB")
+  /// Points awarded on first verified discovery by a squad.
+  points      Int     @default(0)
+  /// salt:sha256hex of the normalised flag. NEVER the flag itself.
+  /// Optional, and normally NULL.
+  ///
+  /// Flag custody belongs to ORION, the only system that verifies a discovery.
+  /// This portal stores the bug CATALOGUE — identity, title and point value — so
+  /// it can resolve an inbound event and render progress. A second copy of the
+  /// answers here would mean two systems that could each award a bug, which is
+  /// exactly the split brain the integration exists to remove.
+  ///
+  /// Kept as a nullable column rather than dropped so a future offline or
+  /// fallback verification mode has somewhere to live without a migration.
+  flagHash    String?
+  /// Retired bugs stop accepting submissions without losing awarded history.
+  isActive    Boolean @default(true)
+
+  /// Which station this bug belongs to. Nullable so a bug can exist before the
+  /// Creator has organised it, and so removing a station never destroys the
+  /// discovery history attached to its bugs (the relation is SetNull).
+  stationId String?
+
+  /// EASY | MEDIUM | HARD | CRITICAL.
+  ///
+  /// Advisory: it drives the default point value the Creator is offered and the
+  /// badge participants see. `points` remains the authoritative award — a Creator
+  /// may deliberately price a bug off-tier, and changing a tier default must never
+  /// silently reprice bugs squads have already earned.
+  difficulty String @default("EASY")
+
+  /// Order within the station. Not unique: reordering swaps values, and a unique
+  /// index would make an in-place swap impossible without a temporary slot.
+  sortOrder Int @default(0)
+
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  station     Level3Station?    @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  discoveries Level3Discovery[]
+  hints       Level3Hint[]
+  penalties   Level3Penalty[]
+
+  @@index([isActive])
+  /// Participant station view: bugs of one station in display order.
+  @@index([stationId, sortOrder])
+}
+
+/// A Level 3 investigation station — a grouping of related bugs, usually one
+/// target application or one theme.
+///
+/// Modelled on nothing in Level 2, which has no station concept. It follows the
+/// project's existing conventions instead: cuid ids, an isActive flag rather than
+/// hard deletion, explicit ordering, and timestamps.
+model Level3Station {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+
+  /// Display order. Deliberately NOT unique — see Level3Bug.sortOrder.
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  /// External challenge target for this station.
+  ///
+  /// Configuration, never hardcoded in a component: event infrastructure moves,
+  /// and a redeploy to change an address mid-event is not acceptable. Optional,
+  /// because a station may be portal-only.
+  challengeUrl   String?
+  challengeLabel String?
+
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  bugs      Level3Bug[]
+
+  /// Participant sidebar: active stations in display order.
+  @@index([isActive, sortOrder])
+}
+
+/// A purchasable hint for one Level 3 bug.
+///
+/// Content lives here rather than on the bug so a hint can be edited, added or
+/// withdrawn without touching the bug's identity or its point value.
+model Level3Hint {
+  id    String @id @default(cuid())
+  bugId String
+
+  /// 1 or 2. The penalty for each is fixed by event policy, not stored per hint —
+  /// see LEVEL3_HINT_PENALTIES in lib/level3/scoring-policy.ts.
+  hintNumber Int
+  content    String
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  bug       Level3Bug @relation(fields: [bugId], references: [id], onDelete: Cascade)
+
+  @@unique([bugId, hintNumber])
+  @@index([bugId])
+}
+
+/// An auditable record that a squad spent a hint.
+///
+/// A SEPARATE record rather than a decrement on the discovery, for two reasons.
+/// A squad may unlock a hint for a bug it never solves, so there is often no
+/// discovery row to decrement. And mutating an award destroys the evidence of why
+/// a score changed — the one question that matters when a squad disputes a total.
+///
+/// `@@unique([teamId, bugId, hintNumber])` is what makes double-charging
+/// impossible: two teammates pressing Unlock at the same instant both pass any
+/// application-level check, and only the index can arbitrate between them.
+model Level3Penalty {
+  id         String @id @default(cuid())
+  teamId     String
+  bugId      String
+  hintNumber Int
+
+  /// Positive magnitude of the deduction, as charged. Snapshotted so a later
+  /// policy change cannot retroactively alter what a squad already paid.
+  points Int
+
+  /// Which member spent the hint. Audit only; the squad bears the cost.
+  unlockedById String?
+
+  createdAt  DateTime  @default(now())
+  team       Team      @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  bug        Level3Bug @relation(fields: [bugId], references: [id], onDelete: Cascade)
+  unlockedBy User?     @relation(fields: [unlockedById], references: [id], onDelete: SetNull)
+
+  @@unique([teamId, bugId, hintNumber])
+  /// Score aggregation: sum(points) where teamId = ?.
+  @@index([teamId])
+  @@index([bugId])
+}
+
+/// A squad's verified discovery of one Level 3 bug.
+///
+/// `@@unique([teamId, bugId])` is the whole anti-double-scoring mechanism, and it
+/// lives in the DATABASE rather than in an application check. Two concurrent
+/// submissions of the same flag both pass a read-then-write guard under any MVCC
+/// engine; against this index one commits and the other takes P2002 and is told
+/// the bug was already credited. There is no interleaving that awards a squad
+/// points twice for one bug.
+model Level3Discovery {
+  id             String  @id @default(cuid())
+  teamId         String
+  bugId          String
+  /// Which member submitted the winning flag — for audit, not for scoring.
+  ///
+  /// NULL for a discovery ingested from ORION: that verification happened in the
+  /// external challenge application, which knows the squad but not which member
+  /// was at the keyboard. The squad is the actor for scoring purposes either way,
+  /// so this is an audit detail rather than a missing foreign key.
+  discoveredById String?
+
+  /// Points as awarded AT DISCOVERY TIME.
+  ///
+  /// Snapshotted rather than joined to `Level3Bug.points` so that a Creator
+  /// correcting a bug's value mid-event cannot silently rewrite scores already
+  /// earned. The automatic score is still DERIVED (a SUM over these rows), never
+  /// accumulated as a delta.
+  awardedPoints Int
+
+  discoveredAt DateTime  @default(now())
+  team         Team      @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  bug          Level3Bug @relation(fields: [bugId], references: [id], onDelete: Cascade)
+  discoveredBy User?     @relation(fields: [discoveredById], references: [id], onDelete: SetNull)
+
+  @@unique([teamId, bugId])
+  /// Automatic score aggregation: sum(awardedPoints) where teamId = ?.
+  @@index([teamId])
+  @@index([bugId])
+  @@index([discoveredById])
+}
+
+/// Inbound server-to-server event from the ORION Level 3 challenge application.
+///
+/// Every accepted or rejected integration request lands here exactly once. The
+/// table is the replay defence, and it is a DATABASE defence rather than an
+/// application one on purpose: two copies of the same event delivered
+/// concurrently both pass any "have I seen this?" read, and only a unique index
+/// can arbitrate between them.
+///
+/// `eventId` is the sender's idempotency key — a redelivery of the same logical
+/// discovery. `nonce` is single-use per request. They are separate columns
+/// because they answer different questions: eventId asks "is this the same
+/// event?", nonce asks "is this the same *request*?". A retry legitimately
+/// reuses an eventId with a fresh nonce; nothing legitimately reuses a nonce.
+/// Level 1 challenge catalogue — one row per scored question in the external
+/// Level 1 application.
+///
+/// THE POINT VALUE LIVES HERE AND NOWHERE ELSE ON THE INBOUND PATH.
+///
+/// Level 1 is an application participants are actively attacking. If it ever told
+/// this portal what a question was worth, a participant who compromised it could
+/// set their own score. So Level 1 reports only WHICH question was solved; this
+/// table decides what that is worth. A `points` field in an inbound request body
+/// is ignored, exactly as it is on the ORION bridge.
+///
+/// Deliberately modelled on Level3Bug rather than on Evaluation: this is an
+/// automatically-verified, per-item award, not a human-marked deliverable.
+model Level1Challenge {
+  id   String @id @default(cuid())
+  /// Participant-facing label, e.g. "A3". Renameable without breaking the bridge.
+  code String @unique
+
+  /// The question code the Level 1 application sends, e.g. "A3" or "C1".
+  /// Separate from `code` so the display label can change without invalidating
+  /// the integration, and so a catalogue entry can exist with no counterpart yet.
+  externalRef String @unique
+
+  title String
+  /// "A" | "B" | "C" — which Level 1 track the question belongs to.
+  track String @default("A")
+
+  /// Authoritative award for a first verified solve.
+  points Int @default(0)
+
+  /// Retired questions stop accepting new results without losing awarded history.
+  isActive Boolean @default(true)
+
+  /// Display order within a track. Not unique — reordering swaps values.
+  sortOrder Int @default(0)
+
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  results   Level1Result[]
+  penalties Level1Penalty[]
+
+  @@index([isActive])
+  @@index([track, sortOrder])
+}
+
+/// A squad's verified solve of one Level 1 question.
+///
+/// `@@unique([teamId, challengeId])` is the entire anti-double-scoring mechanism,
+/// and it lives in the DATABASE rather than in an application check — for the same
+/// reason it does on Level3Discovery. Two concurrent deliveries of the same event
+/// both pass a read-then-write guard; only a unique index can arbitrate. A second
+/// delivery takes P2002 and is absorbed as an idempotent success worth 0 points.
+model Level1Result {
+  id          String @id @default(cuid())
+  teamId      String
+  challengeId String
+
+  /// Points as awarded AT THE MOMENT OF THE SOLVE, resolved from
+  /// `Level1Challenge.points`. Snapshotted so that re-pricing a question mid-event
+  /// cannot silently rewrite scores squads already earned. The official score is
+  /// still DERIVED — a SUM over these rows — never accumulated as a delta.
+  awardedPoints Int
+
+  /// When the Level 1 application verified the solve, as it reported it. Advisory:
+  /// used for display and reconciliation, never for authorisation. `recordedAt` is
+  /// the timestamp this portal trusts.
+  solvedAt   DateTime?
+  recordedAt DateTime  @default(now())
+
+  team      Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  challenge Level1Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, challengeId])
+  /// Score aggregation: sum(awardedPoints) where teamId = ?.
+  @@index([teamId])
+  @@index([challengeId])
+}
+
+/// An auditable record that a squad spent a Level 1 hint.
+///
+/// A separate record rather than a reduction of the award, for the same two
+/// reasons it is separate on Level 3: a squad may buy a hint for a question it
+/// never solves, so there is often no result row to reduce; and mutating an award
+/// destroys the evidence of why a score changed, which is the one question that
+/// matters when a squad disputes a total.
+///
+/// `@@unique([teamId, challengeId, hintNumber])` makes double-charging impossible
+/// under concurrent or redelivered events.
+model Level1Penalty {
+  id          String @id @default(cuid())
+  teamId      String
+  challengeId String
+  /// Level 1 offers one hint per question today. The column exists so a second
+  /// hint tier needs no migration.
+  hintNumber  Int    @default(1)
+
+  /// Positive magnitude of the deduction, as charged. Snapshotted so a later
+  /// policy change cannot retroactively alter what a squad already paid.
+  points Int
+
+  createdAt DateTime        @default(now())
+  team      Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  challenge Level1Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, challengeId, hintNumber])
+  @@index([teamId])
+  @@index([challengeId])
+}
+
+/// A single-use, short-lived ticket that carries a squad's identity across the
+/// hop from this portal to an external challenge application.
+///
+/// WHY A TICKET AND NOT A CREDENTIAL
+/// ---------------------------------
+/// Squad passwords are stored as scrypt hashes and this portal has no capability
+/// to reveal a plaintext one — see lib/auth/temporary-credential.ts. There is
+/// therefore nothing to hand across, and inventing something would mean either
+/// holding plaintext or minting a second long-lived credential. A ticket is
+/// neither: it authorises exactly one identity lookup, once, within two minutes.
+///
+/// WHY ONLY THE HASH IS STORED
+/// ---------------------------
+/// The ticket travels in a URL. A database read must not yield a usable ticket,
+/// so the row holds SHA-256 of it. Verification hashes the presented value and
+/// looks that up — the same reason session tokens elsewhere are compared, not
+/// printed.
+///
+/// WHY REDEMPTION IS SERVER-TO-SERVER
+/// ----------------------------------
+/// Holding the ticket is not enough to redeem it: redemption is an HMAC-signed
+/// request that only the external application's server can compose. A ticket
+/// observed in a browser history or a Referer header buys an attacker nothing.
+model IntegrationTicket {
+  id String @id @default(cuid())
+
+  /// SHA-256 hex of the ticket value. NEVER the ticket itself.
+  tokenHash String @unique
+
+  teamId String
+  /// Which level this ticket admits the squad to. A Level 1 ticket cannot be
+  /// redeemed at a Level 3 endpoint.
+  level  Int    @default(1)
+
+  /// Who clicked. Audit only — the squad is the subject of the ticket.
+  issuedToUserId String?
+
+  expiresAt  DateTime
+  /// Stamped by the atomic redemption UPDATE. Non-null means spent.
+  redeemedAt DateTime?
+
+  createdAt DateTime @default(now())
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  /// Reaper for expired, unredeemed tickets.
+  @@index([expiresAt])
+  @@index([teamId, level])
+}
+
+model IntegrationEvent {
+  id        String @id @default(cuid())
+  /// Sender's idempotency key. A redelivery collides here and is absorbed.
+  eventId   String @unique
+  /// Single-use per request; a repeat means a replayed HTTP request.
+  nonce     String @unique
+  eventType String
+  /// "ORION" | "LEVEL1". Which bridge delivered the event.
+  source    String @default("ORION")
+
+  /// Recorded as SENT, before resolution, so a rejected event still leaves a
+  /// trace of what was claimed. Never used to resolve anything.
+  externalTeamRef String
+
+  /// The external ITEM reference the sender named: an ORION bug ref on the Level 3
+  /// bridge, a Level 1 question code on the Level 1 bridge.
+  ///
+  /// The column keeps its original Level-3-era name deliberately. Renaming it in
+  /// SQLite means Prisma recreating and repopulating the table, which is a
+  /// destructive-shaped migration for a cosmetic gain on a table that is the
+  /// event's replay-protection ledger. Worth doing in a quiet window; not worth
+  /// doing as part of adding a second bridge.
+  externalBugRef String?
+
+  /// ACCEPTED | DUPLICATE_DISCOVERY | REJECTED_<reason>
+  outcome    String
+  receivedAt DateTime @default(now())
+
+  @@index([receivedAt])
+  @@index([outcome])
+  @@index([externalTeamRef])
+}
+
+/// Additional points / score adjustments requested by evaluators and approved by admins.
+model ScoreAdjustment {
+  id                String    @id @default(cuid())
+  teamId            String
+  level             Int // 1, 2, 3
+  points            Int
+  reason            String
+  evidenceNote      String?
+  status            String    @default("PENDING") // PENDING, APPROVED, REJECTED
+  requestedByUserId String
+  reviewedByUserId  String?
+  reviewedAt        DateTime?
+  rejectionReason   String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  team        Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  requestedBy User  @relation("ScoreAdjustmentRequestedBy", fields: [requestedByUserId], references: [id], onDelete: Cascade)
+  reviewedBy  User? @relation("ScoreAdjustmentReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([teamId])
+  @@index([level])
+  @@index([status])
+  @@index([requestedByUserId])
+  @@index([reviewedByUserId])
+  @@index([createdAt])
+  @@index([teamId, level, status])
+  @@index([status, createdAt])
+}
+
+/// Level 3 event configuration — the Creator's single source of truth for the
+/// values participants see on the Level 3 page.
+///
+/// ---------------------------------------------------------------------------
+/// WHY A ROW AND NOT A CONSTANT
+/// ---------------------------------------------------------------------------
+/// The target address and the track point ceilings change between rehearsal and
+/// event day, and sometimes during the event itself. Held in code they would
+/// need a redeploy to change, which is not an option once participants are
+/// working. Held here, a Creator edits them and every participant's next render
+/// picks them up.
+///
+/// SINGLETON, DELIBERATELY. This portal instance hosts exactly ONE event — there
+/// is no Event model, and LevelState / PortalSetting are singletons for the same
+/// reason. The fixed `default` id makes that explicit and makes every read a
+/// primary-key lookup. If multi-event is ever introduced, this row grows an
+/// `eventId` and the unique constraint moves to it; nothing else about the shape
+/// has to change.
+///
+/// The SAMPLE REPORT is deliberately NOT here — it is a file, and files already
+/// have a home in `LevelResource` (levelNumber 3, resourceKey SAMPLE_REPORT)
+/// with validation, magic-byte checking, audit logging and an authenticated
+/// streaming endpoint. A second upload path would be a second thing to secure.
+model Level3Config {
+  id String @id @default("default")
+
+  /// IPv4 address of the Level 3 investigation target, or NULL when the Creator
+  /// has not set one yet. Validated server-side as dotted-quad IPv4 before it is
+  /// ever written; IPv6 is rejected explicitly rather than silently stored.
+  ///
+  /// DISPLAY AND CONFIGURATION ONLY. Nothing in the portal connects to it, fetches
+  /// from it, or resolves it — that would turn a Creator-editable field into an
+  /// SSRF primitive.
+  targetIp String?
+
+  /// Discovery points available in Track 1, before Track 2 is released.
+  track1Points Int @default(3500)
+
+  /// CUMULATIVE discovery points available once Track 2 is released — it already
+  /// includes Track 1. It is not added to track1Points; it replaces it. Storing
+  /// the cumulative figure rather than a delta is what makes double-counting
+  /// impossible to express.
+  track2Points Int @default(6500)
+
+  /// Whether Track 2 has been released. Selects which of the two figures above is
+  /// the currently available discovery ceiling.
+  track2Released Boolean @default(false)
+
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+}

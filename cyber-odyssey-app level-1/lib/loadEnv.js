@@ -1,0 +1,30 @@
+// Tiny stand-in for the `dotenv` package so standalone scripts (db/init.js,
+// db/seed.js) pick up `.env` without adding another dependency — Next.js
+// itself already loads `.env` automatically for `next dev`/`next build`,
+// this is only needed for scripts run directly with `node`.
+const fs = require("fs");
+const path = require("path");
+
+function loadEnv() {
+  const envPath = path.join(__dirname, "..", ".env");
+  if (!fs.existsSync(envPath)) return;
+
+  const lines = fs.readFileSync(envPath, "utf8").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+module.exports = { loadEnv };

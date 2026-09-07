@@ -1,0 +1,23 @@
+# Secrets and credentials — NEVER commit.
+#
+# This directory holds the cookie-signing secret, the admin password, the
+# database connection string and the Portal integration secret. It also holds
+# team-codes.csv, which db/seed.js writes with every team's PLAINTEXT password.
+# Any one of those in a repository is a full compromise of the level.
+.env
+.env.*
+!.env.example
+team-codes.csv
+*.csv
+
+# Build output and dependencies
+.next/
+node_modules/
+out/
+build/
+
+# Logs and OS noise
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store

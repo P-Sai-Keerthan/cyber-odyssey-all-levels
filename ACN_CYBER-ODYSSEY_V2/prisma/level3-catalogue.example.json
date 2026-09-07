@@ -1,0 +1,75 @@
+[
+  {
+    "name": "Station 1 — Perimeter",
+    "description": "Reconnaissance and exposed surface of the ORION employee portal.",
+    "challengeUrl": "http://100.59.255.15:5000/participant-login",
+    "challengeLabel": "Open ORION Portal",
+    "sortOrder": 1,
+    "bugs": [
+      {
+        "externalRef": "1",
+        "code": "01",
+        "title": "Retired backup archive still reachable",
+        "difficulty": "EASY",
+        "category": "Information Disclosure",
+        "sortOrder": 1,
+        "hints": [
+          { "hintNumber": 1, "content": "Look for legacy notices on the landing page." },
+          {
+            "hintNumber": 2,
+            "content": "Follow the recovery storage link and check what is downloadable."
+          }
+        ]
+      },
+      {
+        "externalRef": "3",
+        "code": "02",
+        "title": "IDOR on the employee profile view",
+        "difficulty": "EASY",
+        "category": "IDOR",
+        "sortOrder": 2,
+        "hints": [
+          { "hintNumber": 1, "content": "Inspect the query parameters while viewing a profile." }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Station 2 — Application Logic",
+    "description": "Injection and access-control flaws in the portal's core features.",
+    "challengeUrl": "http://100.59.255.15:5000/participant-login",
+    "challengeLabel": "Open ORION Portal",
+    "sortOrder": 2,
+    "bugs": [
+      {
+        "externalRef": "16",
+        "code": "03",
+        "title": "SQL injection in employee search",
+        "difficulty": "MEDIUM",
+        "category": "SQL Injection",
+        "sortOrder": 1,
+        "hints": [
+          { "hintNumber": 1, "content": "The search field is passed straight into a query." }
+        ]
+      },
+      {
+        "externalRef": "t2_06",
+        "code": "04",
+        "title": "Blind and time-based SQL injection",
+        "difficulty": "HARD",
+        "category": "SQL Injection",
+        "sortOrder": 2,
+        "hints": []
+      },
+      {
+        "externalRef": "t2_20",
+        "code": "05",
+        "title": "Master breach reconstruction",
+        "difficulty": "CRITICAL",
+        "category": "Incident Forensics",
+        "sortOrder": 3,
+        "hints": []
+      }
+    ]
+  }
+]

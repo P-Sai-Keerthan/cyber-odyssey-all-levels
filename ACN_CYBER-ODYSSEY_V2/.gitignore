@@ -1,0 +1,75 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env*.local
+.env
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# =============================================================================
+# RUNTIME DATA — never commit (Phase 17 / SEC-17-06)
+# =============================================================================
+# The SQLite database and the uploads directory were NOT ignored. Committing
+# them would have published, in plain view of anyone with repository access:
+#   - every account's email address and scrypt password hash
+#   - every squad's PRIVATE join code and squad password hash
+#   - every live session token (a valid token is an account takeover)
+#   - every participant's submitted evidence files
+#
+# These are runtime artefacts, not source. The schema lives in
+# prisma/schema.prisma and prisma/migrations/; the database is rebuilt with
+# `npm run db:migrate && npm run db:seed`. Upload directories are created on
+# demand by the application.
+#
+# If this repository has ALREADY been pushed with a database committed, adding
+# these rules is not sufficient — the data remains in git history. Rotate every
+# credential and purge the history before treating it as clean.
+
+# SQLite database and its WAL/shared-memory sidecars
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/prisma/*.db
+/prisma/*.db-journal
+/prisma/*.db-wal
+/prisma/*.db-shm
+
+# Participant submissions and Creator-managed level resources
+/uploads/
+
+# Database backups
+/backups/
+
+# Level 3 bug catalogue. Holds no flags (ORION owns those), but the point values
+# are competition configuration, so real event files stay out of the repository.
+prisma/level3-catalogue.json
+prisma/level3-catalogue.*.json
+!prisma/level3-catalogue.example.json
+
+# Test datasource — points at a disposable database the suites truncate.
+.env.test

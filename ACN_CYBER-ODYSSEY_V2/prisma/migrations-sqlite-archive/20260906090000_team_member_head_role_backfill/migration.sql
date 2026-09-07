@@ -1,0 +1,22 @@
+-- Normalise the squad-captain roster role to 'HEAD'.
+--
+-- DATA ONLY. No column, index or constraint changes.
+--
+-- `TeamMember.role` held two spellings for one thing. `createTeamAction` writes
+-- 'HEAD'; older code and scripts/seed-local-testing.ts wrote 'CREATOR' — which is
+-- also the name of an unrelated ACCOUNT role in this portal (event staff), so the
+-- same string meant two different things depending on which table you were
+-- looking at.
+--
+-- The read sites disagreed about which spelling counted, and the one in
+-- src/lib/actions/admin-actions.ts accepted only 'HEAD'. On a database carrying
+-- the legacy value, the Admin -> Teams console therefore showed every squad with
+-- no captain, while the Creator console showed the captain correctly.
+--
+-- The source is fixed (the seed now writes 'HEAD', and every read site goes
+-- through src/lib/team/roles.ts). This brings existing rows into line so the two
+-- consoles agree about squads created before that change.
+--
+-- Idempotent and safe to re-run: it only ever rewrites rows still holding the
+-- legacy value.
+UPDATE "TeamMember" SET "role" = 'HEAD' WHERE "role" = 'CREATOR';

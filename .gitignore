@@ -1,0 +1,34 @@
+# Compose environment — carries every secret for the stack.
+.env
+.env.docker
+.env.*
+!.env.example
+
+# Secrets & confidential data
+team-codes.csv
+prisma/level3-catalogue.json
+prisma/level3-catalogue.*.json
+!prisma/level3-catalogue.example.json
+
+# Build outputs & dependencies
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+
+# SQLite databases & runtime data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+uploads/
+backups/
+
+# Logs & OS metadata
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+

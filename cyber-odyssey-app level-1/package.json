@@ -1,0 +1,27 @@
+{
+  "name": "cyber-odyssey-level1",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start -p 3001",
+    "db:init": "node db/init.js",
+    "db:seed": "node db/seed.js",
+    "test": "node scripts/run-tests.js && node scripts/test-rate-limit.js",
+    "test:integration": "node scripts/test-integration.js",
+    "test:e2e": "node scripts/test-e2e-http.js",
+    "test:scale": "node scripts/test-concurrency-scale.js",
+    "outbox:drain": "node scripts/drain-outbox.js",
+    "outbox:watch": "node scripts/drain-outbox.js --watch",
+    "outbox:status": "node scripts/drain-outbox.js --status",
+    "test:ratelimit": "node scripts/test-rate-limit.js"
+  },
+  "dependencies": {
+    "nanoid": "3.3.18",
+    "next": "^16.3.4",
+    "pg": "8.13.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
