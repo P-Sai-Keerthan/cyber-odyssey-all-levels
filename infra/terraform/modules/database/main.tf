@@ -162,7 +162,7 @@ resource "null_resource" "portal_database" {
         --cluster ${var.ecs_cluster_arn} `
         --launch-type FARGATE `
         --task-definition ${aws_ecs_task_definition.db_bootstrap.arn} `
-        --network-configuration 'awsvpcConfiguration={subnets=[${join(",", var.private_subnet_ids)}],securityGroups=[${var.security_group_id}],assignPublicIp=DISABLED}' `
+        --network-configuration 'awsvpcConfiguration={subnets=[${join(",", var.private_subnet_ids)}],securityGroups=[${var.ecs_security_group_id}],assignPublicIp=DISABLED}' `
         --query "tasks[0].taskArn" --output text
       if (-not $taskArn -or $taskArn -eq "None") {
         Write-Error "run-task did not return a task ARN"

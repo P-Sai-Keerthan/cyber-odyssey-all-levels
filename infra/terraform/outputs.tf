@@ -19,6 +19,10 @@ output "ecs_cluster_name" {
   value = aws_ecs_cluster.this.name
 }
 
+output "portal_seed_task_definition_arn" {
+  value = module.ecs.portal_seed_task_definition_arn
+}
+
 output "uploads_bucket_name" {
   value = module.storage.bucket_name
 }

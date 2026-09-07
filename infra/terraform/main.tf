@@ -38,6 +38,7 @@ module "database" {
   vpc_id                  = module.network.vpc_id
   private_subnet_ids      = module.network.private_subnet_ids
   security_group_id       = module.network.rds_security_group_id
+  ecs_security_group_id   = module.network.ecs_security_group_id
   instance_class          = var.db_instance_class
   allocated_storage_gb    = var.db_allocated_storage_gb
   multi_az                = var.db_multi_az
@@ -61,8 +62,20 @@ locals {
   # portal_desired_count=2 that's 40 connections, leaving headroom for
   # Level 1, the outbox drainer, and manual psql access. Raise this back to
   # 40 if/when the RDS instance is upgraded off db.t4g.micro.
-  portal_database_url = "postgresql://${module.database.master_username}:${module.secrets.postgres_master_password}@${module.database.endpoint}:${module.database.port}/${module.database.portal_db_name}?schema=public&connection_limit=20&pool_timeout=20&connect_timeout=10"
-  level1_database_url = "postgresql://${module.database.master_username}:${module.secrets.postgres_master_password}@${module.database.endpoint}:${module.database.port}/${module.database.level1_db_name}"
+  portal_database_url = "postgresql://${module.database.master_username}:${module.secrets.postgres_master_password}@${module.database.endpoint}:${module.database.port}/${module.database.portal_db_name}?schema=public&connection_limit=20&pool_timeout=20&connect_timeout=10&sslmode=require"
+  # sslmode=require is load-bearing here, unlike for Prisma above: RDS's
+  # default parameter group rejects unencrypted connections (pg_hba.conf
+  # entries are all `hostssl`), and Level 1 connects with the raw `pg`
+  # driver, whose default is NO ssl unless the connection string says
+  # otherwise -- unlike libpq's "prefer" default, which is why the Portal's
+  # Prisma connection and the psql-based bootstrap task didn't need this.
+  # uselibpqcompat=true is ALSO load-bearing: current pg-connection-string
+  # versions treat bare sslmode=require as an alias for verify-full, which
+  # fails because Node has no bundled RDS CA chain to verify against.
+  # libpq-compat mode restores require's traditional meaning -- encrypted,
+  # not cert-validated -- which is what psql's "prefer" default already gave
+  # the bootstrap task for free.
+  level1_database_url = "postgresql://${module.database.master_username}:${module.secrets.postgres_master_password}@${module.database.endpoint}:${module.database.port}/${module.database.level1_db_name}?sslmode=require&uselibpqcompat=true"
 }
 
 resource "aws_secretsmanager_secret" "portal_database_url" {

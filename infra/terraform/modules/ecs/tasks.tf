@@ -35,6 +35,54 @@ locals {
     { name = "DATABASE_URL", valueFrom = var.level1_database_url_secret_arn },
     { name = "ODYSSEY_LEVEL1_SECRET", valueFrom = var.odyssey_level1_secret_arn },
   ]
+
+  # Mirrors src/lib/auth/password.ts's hashPassword() exactly (scrypt,
+  # 16-byte hex salt, 64-byte key, `salt:hex` format) so the app's own
+  # verifyPassword() accepts what this creates. See the comment on
+  # aws_ecs_task_definition.portal_seed for why this exists instead of
+  # running the real seed script.
+  creator_bootstrap_script = <<-EOT
+    const { PrismaClient } = require('@prisma/client');
+    const { scrypt, randomBytes } = require('crypto');
+    const { promisify } = require('util');
+    const scryptAsync = promisify(scrypt);
+
+    async function hashPassword(password) {
+      const salt = randomBytes(16).toString('hex');
+      const derivedKey = await scryptAsync(password, salt, 64);
+      return salt + ':' + derivedKey.toString('hex');
+    }
+
+    async function main() {
+      const email = (process.env.CREATOR_EMAIL || '').trim().toLowerCase();
+      const username = (process.env.CREATOR_USERNAME || 'event_creator').trim();
+      const password = process.env.CREATOR_PASSWORD || '';
+      if (!email || !password) {
+        console.error('CREATOR_EMAIL and CREATOR_PASSWORD must both be set.');
+        process.exit(1);
+      }
+      if (password.length < 12) {
+        console.error('CREATOR_PASSWORD must be at least 12 characters.');
+        process.exit(1);
+      }
+      const passwordHash = await hashPassword(password);
+      const prisma = new PrismaClient();
+      await prisma.user.upsert({
+        where: { email },
+        update: { username, role: 'CREATOR', status: 'ACTIVE', passwordHash },
+        create: { email, username, passwordHash, role: 'CREATOR', status: 'ACTIVE' },
+      });
+      await prisma.portalSetting.upsert({
+        where: { id: 'default' },
+        update: {},
+        create: { id: 'default', isOnline: true },
+      });
+      console.log('Creator account ready:', email);
+      await prisma.$disconnect();
+    }
+
+    main().catch((e) => { console.error(e); process.exit(1); });
+  EOT
 }
 
 resource "aws_ecs_task_definition" "portal" {
@@ -75,6 +123,70 @@ resource "aws_ecs_task_definition" "portal" {
   ])
 }
 
+# One-off task that creates/rotates the Creator account. A SEPARATE task
+# definition from the running service, specifically so CREATOR_PASSWORD can
+# go through the same `secrets` (Secrets Manager) mechanism as everything
+# else here — `aws ecs run-task --overrides` has no equivalent of a secrets
+# override, only plaintext `environment` overrides, which are stored in the
+# task's own describable metadata indefinitely. A plaintext password there
+# would be exactly the kind of exposure this module otherwise avoids
+# everywhere else.
+#
+# This does NOT run `prisma/seed.ts` (the full dev/demo fixture — 10
+# hardcoded pre-registered test emails, sample announcements, placeholder
+# Level 2 resource files). Two independent reasons:
+#   1. `prisma db seed` needs tsx, which RUNBOOK.md explains is deliberately
+#      NOT in the runtime image.
+#   2. seed.ts's own import of `../src/lib/auth/password` can't resolve
+#      either: `src/` isn't copied into the image at all (Next's standalone
+#      output only traces what the SERVER needs, not arbitrary scripts).
+# RUNBOOK.md's Docker section already runs the real `npm run db:seed` from a
+# full checkout against the container's exposed DB port for exactly this
+# reason. On AWS, that means a full checkout with real network access to
+# RDS (which is deliberately not internet-reachable) — a separate, later
+# step, not this one.
+#
+# What this DOES do is hand-replicate the one part of seed.ts that's
+# actually load-bearing for a working deployment: without a Creator account
+# nobody can sign in to administer the portal at all. It reimplements
+# `hashPassword` from src/lib/auth/password.ts (scrypt, 16-byte salt,
+# 64-byte key, `salt:hex` format) inline, using only what the runtime image
+# already has: @prisma/client and Node's built-in crypto/util.
+resource "aws_ecs_task_definition" "portal_seed" {
+  family                   = "${var.environment_name}-portal-seed"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.portal_execution.arn
+  task_role_arn            = aws_iam_role.portal_task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "portal-seed"
+      image     = "${aws_ecr_repository.portal.repository_url}:${var.portal_image_tag}"
+      essential = true
+      command   = ["node", "-e", local.creator_bootstrap_script]
+      environment = [
+        { name = "NODE_ENV", value = "production" },
+        { name = "CREATOR_EMAIL", value = var.creator_email },
+        { name = "CREATOR_USERNAME", value = var.creator_username },
+      ]
+      secrets = concat(local.portal_secrets, [
+        { name = "CREATOR_PASSWORD", valueFrom = var.creator_password_arn },
+      ])
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.portal.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "seed"
+        }
+      }
+    }
+  ])
+}
+
 resource "aws_ecs_task_definition" "level1" {
   family                   = "${var.environment_name}-level1"
   requires_compatibilities = ["FARGATE"]
@@ -82,6 +194,7 @@ resource "aws_ecs_task_definition" "level1" {
   cpu                      = tostring(var.level1_cpu)
   memory                   = tostring(var.level1_memory)
   execution_role_arn       = aws_iam_role.level1_execution.arn
+  task_role_arn            = aws_iam_role.level1_task.arn
 
   container_definitions = jsonencode([
     {

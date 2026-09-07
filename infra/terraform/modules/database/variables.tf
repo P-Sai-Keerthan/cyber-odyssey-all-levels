@@ -11,6 +11,17 @@ variable "private_subnet_ids" {
 }
 
 variable "security_group_id" {
+  description = "RDS's own security group (attached to the DB instance's ENI)."
+  type        = string
+}
+
+variable "ecs_security_group_id" {
+  description = <<-EOT
+    ECS tasks' security group — attached to the one-off bootstrap task's ENI,
+    NOT to the RDS instance. RDS's own security group only allows ingress
+    FROM this one; a task can't reach RDS while wearing RDS's security group
+    instead of the group RDS's ingress rule actually trusts.
+  EOT
   type = string
 }
 

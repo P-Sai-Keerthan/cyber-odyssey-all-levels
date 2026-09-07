@@ -18,6 +18,10 @@ output "portal_task_definition_family" {
   value = aws_ecs_task_definition.portal.family
 }
 
+output "portal_seed_task_definition_arn" {
+  value = aws_ecs_task_definition.portal_seed.arn
+}
+
 output "level1_task_definition_family" {
   value = aws_ecs_task_definition.level1.family
 }

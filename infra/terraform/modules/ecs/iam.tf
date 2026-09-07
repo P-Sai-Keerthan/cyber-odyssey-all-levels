@@ -55,8 +55,35 @@ resource "aws_iam_role_policy_attachment" "portal_task_s3" {
 # ---------------------------------------------------------------------------
 # Level 1 — shared by the web service and the outbox-drainer service, since
 # the drainer's secret needs are a strict subset of the web service's.
-# Neither needs a task role: neither calls an AWS API from inside the app.
 # ---------------------------------------------------------------------------
+
+# Only the web service gets this — needed for `aws ecs execute-command`
+# (retrieving team-codes.csv, see RUNBOOK.md), which the outbox drainer has
+# no reason to support. Not "an AWS API the app calls" in the usual sense;
+# the ECS Exec agent inside the task assumes this role to open its SSM
+# channel, independent of anything Level 1's own code does.
+resource "aws_iam_role" "level1_task" {
+  name               = "${var.environment_name}-level1-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+resource "aws_iam_role_policy" "level1_task_exec" {
+  name = "${var.environment_name}-level1-task-exec"
+  role = aws_iam_role.level1_task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+      ]
+      Resource = "*"
+    }]
+  })
+}
 
 resource "aws_iam_role" "level1_execution" {
   name               = "${var.environment_name}-level1-exec"

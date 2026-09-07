@@ -433,37 +433,77 @@ docker push <level1_ecr_repository_url>:latest
 aws ecs update-service --cluster <cluster_name> --service <env>-portal --force-new-deployment
 aws ecs update-service --cluster <cluster_name> --service <env>-level1 --force-new-deployment
 
-# 5. Run migrations and seed the Portal as one-off tasks (same task
-#    definition, overridden command — same commands this document's Docker
-#    section already uses, just launched via run-task instead of a shell):
+# 5. Bootstrap the Creator account. Run this task with NO --overrides at
+#    all -- CREATOR_EMAIL/CREATOR_USERNAME are baked into the
+#    <env>-portal-seed task definition, and CREATOR_PASSWORD is injected
+#    from Secrets Manager the same way DATABASE_URL is for every other
+#    service. Passing the password as a plaintext --overrides environment
+#    value instead would sit in that task's own describable metadata in
+#    plaintext indefinitely -- don't do that.
 aws ecs run-task --cluster <cluster_name> --launch-type FARGATE \
-  --task-definition <env>-portal \
-  --network-configuration "awsvpcConfiguration={subnets=[<private_subnet_ids>],securityGroups=[<ecs_security_group_id>],assignPublicIp=DISABLED}" \
-  --overrides '{"containerOverrides":[{"name":"portal","command":["node","node_modules/prisma/build/index.js","migrate","deploy"]}]}'
-
-# CREATOR_PASSWORD for this comes from Secrets Manager, not a value you choose:
-aws secretsmanager get-secret-value --secret-id <env>/creator-password --query SecretString --output text
-# Then run db:seed the same way, with that value and CREATOR_EMAIL passed as
-# a plaintext environment override (CREATOR_PASSWORD is read only by this
-# one-off command, never by the running service).
+  --task-definition <env>-portal-seed \
+  --network-configuration "awsvpcConfiguration={subnets=[<private_subnet_ids>],securityGroups=[<ecs_security_group_id>],assignPublicIp=DISABLED}"
 ```
+
+**Migrations run automatically — there is no separate step for them.** The
+Portal Dockerfile's `CMD` is
+`prisma migrate deploy && node server.js`, so every time the Portal service
+starts a task (including its very first one), pending migrations apply
+before the server accepts traffic. Nothing above needs to invoke
+`migrate deploy` by hand.
+
+**The Creator bootstrap above does NOT run `prisma/seed.ts`.** That script
+needs `tsx` (deliberately not in the runtime image) and imports from `src/`
+(not copied into the image at all — Next's standalone output only traces
+what the running *server* needs, not arbitrary auxiliary scripts). The
+`<env>-portal-seed` task definition instead runs a small inline script
+(`modules/ecs/tasks.tf`'s `local.creator_bootstrap_script`) that
+hand-replicates just the load-bearing part of seeding — the Creator
+account — using only what the runtime image already has
+(`@prisma/client`, Node's built-in `crypto`).
+
+**If you want the rest of `prisma/seed.ts`** (10 hardcoded demo
+pre-registered participants, sample announcements, placeholder Level 2
+resource files, default evaluation criteria) — decide first whether your
+real event wants that fixture data at all; it reads as dev/demo content,
+not something every deployment needs. If you do want it, it has to run the
+same way RUNBOOK's Docker section already runs it: `npm run db:seed` from a
+full checkout with real network access to `DATABASE_URL`. RDS here is
+deliberately not internet-reachable, so that means a temporary path in —
+SSM port-forwarding through a bastion, or similar — which is a deliberate
+extra step, not a gap in this automation.
 
 ### Level 1's team-codes.csv
 
 `npm run db:seed` on Level 1 regenerates every crew's password and writes
 `team-codes.csv` to the container's local disk — deliberately not S3, since
-it's a one-time operator artifact, not application state. On Fargate that
-disk disappears with the task. Retrieve the file **immediately** after
-running the seed task, before the task stops:
+it's a one-time operator artifact, not application state. Unlike the
+Portal, Level 1's image is NOT built with Next's standalone output (see its
+Dockerfile), so it carries its full `node_modules` and `db/seed.js` is
+plain JavaScript — it runs inside the container with no missing-module
+problem the way the Portal's TypeScript seed script has.
+
+The `<env>-level1` service has `enable_execute_command = true` specifically
+for this. Exec into the **already-running** task (not a one-off — the
+service's persistent task, so there's no race against it stopping) and run
+both commands in the same session:
 
 ```bash
-aws ecs execute-command --cluster <cluster_name> --task <task_arn> \
+# Requires the Session Manager plugin for the AWS CLI, installed locally.
+TASK_ARN=$(aws ecs list-tasks --cluster <cluster_name> --service-name <env>-level1 --query 'taskArns[0]' --output text)
+
+aws ecs execute-command --cluster <cluster_name> --task "$TASK_ARN" \
+  --container level1 --interactive --command "npm run db:seed"
+
+aws ecs execute-command --cluster <cluster_name> --task "$TASK_ARN" \
   --container level1 --interactive --command "cat team-codes.csv"
 ```
 
-(Requires `enableExecuteCommand` on the task/service and the SSM Session
-Manager plugin locally.) Copy the output out immediately — there is no
-second chance once the task stops.
+Copy the output of the second command out immediately — the file exists only
+on this task's ephemeral disk, so it's gone the moment this task is replaced
+(a new deploy, a crash, `force-new-deployment`). Per RUNBOOK's existing
+warning: this is a deliberate pre-event action that regenerates every
+crew's password, never something to run mid-event.
 
 ### Verifying capacity on the real infrastructure
 

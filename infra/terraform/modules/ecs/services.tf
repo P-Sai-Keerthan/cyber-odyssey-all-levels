@@ -66,6 +66,11 @@ resource "aws_ecs_service" "level1" {
   desired_count   = 1
   launch_type     = "FARGATE"
 
+  # Needed to retrieve team-codes.csv (see RUNBOOK.md) -- that file exists
+  # only on the ephemeral task's own disk, so `aws ecs execute-command` is
+  # the only way to read it back before the task that wrote it stops.
+  enable_execute_command = true
+
   network_configuration {
     subnets          = var.private_subnet_ids
     security_groups  = [var.ecs_security_group_id]
