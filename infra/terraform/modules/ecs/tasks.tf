@@ -109,6 +109,13 @@ resource "aws_ecs_task_definition" "portal" {
         { name = "LEVEL1_CHALLENGE_URL", value = "https://${var.level1_domain_name}" },
         { name = "S3_BUCKET", value = var.uploads_bucket_name },
         { name = "AWS_REGION", value = var.aws_region },
+        # The ALB always sets/overwrites X-Forwarded-For with the real client
+        # address. The Portal's login rate limiter (src/lib/auth/login-rate-limit.ts)
+        # reads the RIGHTMOST entry only when this is set, so a forged prefix is
+        # inert. Without it every caller collapses into one "unknown" bucket and
+        # the cross-account spray backstop is silently disabled (mirrors Level 1's
+        # existing TRUST_PROXY setting below).
+        { name = "TRUST_PROXY", value = "1" },
       ]
       secrets = local.portal_secrets
       logConfiguration = {
