@@ -133,7 +133,5 @@ async function deleteObjectRemote(storagePath: string): Promise<void> {
     import('@aws-sdk/client-s3'),
     getClient(),
   ]);
-  await client.send(
-    new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: toS3Key(storagePath) }),
-  );
+  await client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: toS3Key(storagePath) }));
 }

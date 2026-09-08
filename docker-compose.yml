@@ -102,6 +102,23 @@ services:
       # rather than accepting unsigned events).
       ODYSSEY_INTEGRATION_SECRET: ${ODYSSEY_INTEGRATION_SECRET:-}
       LEVEL3_CHALLENGE_URL: ${LEVEL3_CHALLENGE_URL:-}
+
+      # Login throttling: whether X-Forwarded-For may be believed.
+      #
+      # DEFAULTS TO OFF, AND THAT IS CORRECT FOR THIS FILE. The portal service
+      # below publishes its port directly — there is no reverse proxy in this
+      # topology, so nothing overwrites the header. Setting this to 1 here would
+      # let any client send a different X-Forwarded-For on every request, land in
+      # a fresh rate-limit bucket each time, and walk straight past the limiter.
+      #
+      # Set TRUST_PROXY=1 in the root .env ONLY when something that appends to
+      # X-Forwarded-For genuinely sits in front (AWS ALB, nginx, Cloudflare).
+      # The Portal reads the RIGHTMOST entry, which is the one that hop wrote.
+      #
+      # Left off, the Portal simply cannot tell callers apart: the per-account
+      # limit still applies in full, and the cross-account ceiling is skipped
+      # rather than applied globally. Weaker, never broken.
+      TRUST_PROXY: ${TRUST_PROXY:-}
     volumes:
       # Submitted deliverables. The database lives in PostgreSQL now, so there is
       # no SQLite file to persist — only participant uploads.

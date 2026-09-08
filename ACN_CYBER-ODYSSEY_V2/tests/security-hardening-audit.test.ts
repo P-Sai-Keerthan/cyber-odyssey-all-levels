@@ -17,6 +17,7 @@ import { saveSubmissionFile, validateSubmissionMagicBytes } from '@/lib/storage/
 import { sanitizeResourceFilename } from '@/lib/event/level-resources';
 import { hashPassword } from '@/lib/auth/password';
 import { resetEvaluationCriteria } from './helpers/evaluation-criteria';
+import { resetAll as resetLoginRateLimit } from '@/lib/auth/login-rate-limit';
 
 /**
  * A Level 2 final answer that satisfies the server-side rule.
@@ -193,6 +194,31 @@ describe('Phase 14 — Security Hardening, Bug Hunt & Vulnerability Audit Test S
   // 1. AUTHENTICATION & BRUTE-FORCE DEFENSE
   // =========================================================================
   describe('1. Authentication & Brute-Force Defense', () => {
+    /**
+     * The ACCOUNT lockout and the per-connection RATE LIMIT are two different
+     * controls, and these tests are about the first one.
+     *
+     * The rate limiter (lib/auth/login-rate-limit.ts) stops a caller after 5
+     * failures a minute against one identifier, so ten failures can no longer
+     * arrive from ONE connection — by design. The account lockout exists for the
+     * case the rate limiter cannot see: an attacker rotating addresses, where
+     * each new address gets a fresh rate-limit budget while the account's own
+     * counter keeps climbing.
+     *
+     * Clearing the limiter between attempts is how a unit test expresses "these
+     * failures came from different places". Every assertion about the account
+     * lockout itself is unchanged.
+     */
+    const failLoginFromFreshSource = async (identifier: string, password: string) => {
+      resetLoginRateLimit();
+      const fd = new FormData();
+      fd.append('identifier', identifier);
+      fd.append('password', password);
+      return loginAction(fd);
+    };
+
+    beforeEach(() => resetLoginRateLimit());
+
     it('rejects unauthenticated requests safely', async () => {
       vi.spyOn(sessionModule, 'getSessionUser').mockResolvedValue(null);
       const fd = new FormData();
@@ -207,12 +233,9 @@ describe('Phase 14 — Security Hardening, Bug Hunt & Vulnerability Audit Test S
     });
 
     it('locks account after 10 consecutive failed login attempts', async () => {
-      // Simulate 10 failed login attempts
+      // 10 failed attempts, each modelled as arriving from a different source.
       for (let i = 0; i < 10; i++) {
-        const fd = new FormData();
-        fd.append('identifier', participant1.email);
-        fd.append('password', 'WrongPassword123!');
-        const res = await loginAction(fd);
+        const res = await failLoginFromFreshSource(participant1.email, 'WrongPassword123!');
         expect(res.success).toBe(false);
       }
 
@@ -240,10 +263,7 @@ describe('Phase 14 — Security Hardening, Bug Hunt & Vulnerability Audit Test S
     it('does not extend an active lockout when the account owner stays active (SEC-17-02)', async () => {
       // Lock the account.
       for (let i = 0; i < 10; i++) {
-        const fd = new FormData();
-        fd.append('identifier', participant1.email);
-        fd.append('password', 'WrongPassword123!');
-        await loginAction(fd);
+        await failLoginFromFreshSource(participant1.email, 'WrongPassword123!');
       }
 
       const locked = await prisma.user.findUniqueOrThrow({ where: { id: participant1.id } });
@@ -264,10 +284,7 @@ describe('Phase 14 — Security Hardening, Bug Hunt & Vulnerability Audit Test S
     it('clears the lockout and failure counter after a successful sign-in', async () => {
       // Five failures, then a correct password.
       for (let i = 0; i < 5; i++) {
-        const fd = new FormData();
-        fd.append('identifier', participant1.email);
-        fd.append('password', 'WrongPassword123!');
-        await loginAction(fd);
+        await failLoginFromFreshSource(participant1.email, 'WrongPassword123!');
       }
 
       const fdValid = new FormData();
@@ -284,10 +301,7 @@ describe('Phase 14 — Security Hardening, Bug Hunt & Vulnerability Audit Test S
     it('expired lockouts grant a fresh attempt window rather than re-locking immediately', async () => {
       // Lock, then move the expiry into the past.
       for (let i = 0; i < 10; i++) {
-        const fd = new FormData();
-        fd.append('identifier', participant1.email);
-        fd.append('password', 'WrongPassword123!');
-        await loginAction(fd);
+        await failLoginFromFreshSource(participant1.email, 'WrongPassword123!');
       }
       await prisma.user.update({
         where: { id: participant1.id },

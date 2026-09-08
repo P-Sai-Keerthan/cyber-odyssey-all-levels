@@ -40,13 +40,52 @@ const { MemoryRateLimitStore } = require('./rateLimitStore');
 /** Sliding window over which failures accumulate. */
 const WINDOW_MS = 15 * 60 * 1000;
 
+/** Reads a positive integer from the environment, falling back to `fallback`. */
+function envInt(name, fallback) {
+  const n = Number.parseInt(String(process.env[name] || '').trim(), 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Per-address ceiling, RAISED FROM 40, and now configurable.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY 40 WAS AN EVENT-DAY OUTAGE
+ * ---------------------------------------------------------------------------
+ * 40 assumed one address meant roughly one participant. At this event it does
+ * not. A venue NATs every participant behind ONE public address, and when
+ * Level 1 sits behind a reverse proxy the socket address is the PROXY's — so
+ * all ~300 participants land in a single bucket.
+ *
+ * SIZE IT BY PARTICIPANTS, NOT BY TEAMS. The event is 100 teams but up to 300
+ * PEOPLE, and any of them may try the team password. 300 participants x 2
+ * mistypes is 600 failures in one 15-minute window; x3 is 900. An earlier fix
+ * raised this to 500, which still locked the venue at that load - it had been
+ * sized against 100 teams rather than 300 people.
+ *
+ * The ceiling below sits above the worst legitimate case with headroom. It costs
+ * little: the per-(address + team) limit already caps an attacker at 10 failures
+ * per team, so from one address 100 known teams can yield at most ~1000 failures
+ * regardless of this number. This backstop only catches enumeration of UNKNOWN
+ * team names, and a venue outage is a far worse outcome than that headroom.
+ *
+ * The genuine brute-force control is the per-(address + team) limit above. The
+ * team name is part of that key, so NAT does not weaken it at all. This ceiling
+ * is only a backstop against ONE machine spraying MANY accounts, so it belongs
+ * well above any plausible legitimate total rather than just above one team's.
+ *
+ * Override with LEVEL1_MAX_ADDRESS_ATTEMPTS if a venue turns out to be busier.
+ */
 const PROFILES = {
   /** Per (address + team). A crew retyping its own password stays well under this. */
-  team: { maxAttempts: 10, lockoutMs: 5 * 60 * 1000 },
-  /** Per address, across every account. Catches spraying without punishing a shared venue NAT. */
-  teamAddress: { maxAttempts: 40, lockoutMs: 5 * 60 * 1000 },
+  team: { maxAttempts: envInt('LEVEL1_MAX_TEAM_ATTEMPTS', 10), lockoutMs: 5 * 60 * 1000 },
+  /** Per address, across every account. Sized for a whole venue behind one NAT. */
+  teamAddress: {
+    maxAttempts: envInt('LEVEL1_MAX_ADDRESS_ATTEMPTS', 2000),
+    lockoutMs: 5 * 60 * 1000,
+  },
   /** The admin console. One operator, one password — tighter, and a longer lockout. */
-  admin: { maxAttempts: 8, lockoutMs: 10 * 60 * 1000 },
+  admin: { maxAttempts: envInt('LEVEL1_MAX_ADMIN_ATTEMPTS', 8), lockoutMs: 10 * 60 * 1000 },
 };
 
 const store = new MemoryRateLimitStore({ windowMs: WINDOW_MS });

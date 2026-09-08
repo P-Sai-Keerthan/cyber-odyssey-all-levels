@@ -81,7 +81,7 @@ const QUESTIONS = {
     prompt:
       "The JWT payload contains iat: 1770886800, exp: 1770890400 (+60 mins), AND an nbf (Not Before) claim set to 1770887400 (+10 mins after issuance). " +
       "Automated scripts subtract exp - iat (60 mins). Calculate the ACTUAL usable session validity duration in minutes between nbf and exp.",
-    placeholder: "e.g. 50 (or 50 minutes)",
+    placeholder: "Enter your answer here...",
     hint: TOOL_HINT,
     check: checkB1,
   },
@@ -92,7 +92,7 @@ const QUESTIONS = {
     prompt:
       "Privilege is passed inside a scopes permission array in the JWT payload. " +
       "Decode the token payload and inspect the scopes array. What specific scope string grants unauthorized administrative override access?",
-    placeholder: "e.g. role:action",
+    placeholder: "Enter your answer here...",
     hint: TOOL_HINT,
     check: checkB2,
   },
@@ -103,7 +103,7 @@ const QUESTIONS = {
     prompt:
       "Inspect the JWT header 'kid' field. An attacker performed a directory traversal injection to load a legacy dev key file from the host filesystem. " +
       "What is the FULL unformatted 'kid' header string containing the traversal path?",
-    placeholder: "e.g. ../../path/to/key.pem",
+    placeholder: "Enter your answer here...",
     hint: TOOL_HINT,
     check: checkB3,
   },
@@ -114,7 +114,7 @@ const QUESTIONS = {
     prompt:
       "In a classic JWT Algorithm Confusion attack (changing alg from RS256 to HS256), " +
       "what public component of the server's asymmetric keypair is exploited by the attacker as the HMAC symmetric secret key to re-sign the token?",
-    placeholder: "e.g. asymmetric key component",
+    placeholder: "Enter your answer here...",
     hint: TOOL_HINT,
     check: checkB4,
   },

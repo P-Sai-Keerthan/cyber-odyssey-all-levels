@@ -42,7 +42,7 @@ export function EvaluationsHubClient(props: EvaluationApprovalClientProps) {
         </div>
 
         <div className="text-muted-foreground hidden font-mono text-[11px] sm:block">
-          DYNAMIC EVALUATION ENGINE · 1000-PT SYSTEM
+          DYNAMIC EVALUATION ENGINE · PER-LEVEL RUBRIC
         </div>
       </div>
 

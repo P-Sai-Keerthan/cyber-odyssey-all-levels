@@ -320,6 +320,72 @@ console.log('\n4. Concurrency and restart behaviour');
   });
 }
 
+// ---------------------------------------------------------------------------
+console.log('');
+console.log('7. Shared-NAT venue: one address, a hundred teams');
+// ---------------------------------------------------------------------------
+{
+  // REGRESSION: teamAddress was 40. Every participant at the venue shares one
+  // public address (and behind a reverse proxy, one socket address), so 40
+  // failures event-wide locked out the whole room for five minutes. The 41st
+  // person to mistype took all 300 down with them.
+  const rl = freshLimiter({ TRUST_PROXY: undefined, LEVEL1_MAX_ADDRESS_ATTEMPTS: undefined });
+  const VENUE = '203.0.113.9';
+
+  // Size the expectation by PARTICIPANTS, not teams: 100 teams is up to 300
+  // people, and any of them may try the team password. A ceiling of 500 passed
+  // the old 100x2 version of this test and still locked the venue at 300x2.
+  test('300 participants may each fail 3x from one address without a venue lockout', () => {
+    rl.resetAll();
+    const now = Date.now();
+    let failures = 0;
+    for (let team = 0; team < 100; team++) {
+      for (let member = 0; member < 3; member++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          rl.recordFailure('team', VENUE + '|crew-' + team, now);
+          rl.recordFailure('teamAddress', VENUE, now);
+          failures++;
+        }
+      }
+    }
+    assert.strictEqual(failures, 900, 'worst realistic legitimate load');
+    assert.strictEqual(
+      rl.check('teamAddress', VENUE, now).locked,
+      false,
+      '900 legitimate mistypes across 300 participants must not lock the shared venue address',
+    );
+  });
+
+  test('one team mistyping repeatedly is still stopped, and only that team', () => {
+    rl.resetAll();
+    const now = Date.now();
+    for (let i = 0; i < rl.PROFILES.team.maxAttempts; i++) {
+      rl.recordFailure('team', VENUE + '|crew-guessed', now);
+      rl.recordFailure('teamAddress', VENUE, now);
+    }
+    assert.strictEqual(rl.check('team', VENUE + '|crew-guessed', now).locked, true,
+      'the per-team limit still stops a guessing run');
+    assert.strictEqual(rl.check('team', VENUE + '|crew-innocent', now).locked, false,
+      'a different team on the same address is unaffected');
+    assert.strictEqual(rl.check('teamAddress', VENUE, now).locked, false,
+      'and the venue as a whole stays open');
+  });
+
+  test('the per-address backstop still fires against a genuine spray', () => {
+    rl.resetAll();
+    const now = Date.now();
+    const ceiling = rl.PROFILES.teamAddress.maxAttempts;
+    for (let i = 0; i < ceiling; i++) rl.recordFailure('teamAddress', VENUE, now);
+    assert.strictEqual(rl.check('teamAddress', VENUE, now).locked, true,
+      'one machine spraying many accounts is still caught');
+  });
+
+  test('the ceiling is configurable for a busier venue', () => {
+    const tuned = freshLimiter({ TRUST_PROXY: undefined, LEVEL1_MAX_ADDRESS_ATTEMPTS: '900' });
+    assert.strictEqual(tuned.PROFILES.teamAddress.maxAttempts, 900);
+  });
+}
+
 console.log('\n============================================================');
 console.log(`RATE LIMITER RESULTS: ${passed} PASSED, ${failed} FAILED`);
 console.log('============================================================');

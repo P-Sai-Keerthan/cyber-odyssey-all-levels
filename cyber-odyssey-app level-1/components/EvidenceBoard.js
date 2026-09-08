@@ -611,7 +611,7 @@ export default function EvidenceBoard({ onComplete, isCompleted, trackCState }) 
             style={{ marginTop: "1.2rem" }}
           >
             <label htmlFor="c3-answer" style={{ display: "block", marginBottom: "0.5rem", fontWeight: 600 }}>
-              Lost Evidence Sources (e.g. CPU Registers, System RAM, Network Sockets)
+              Lost Evidence Sources
             </label>
             <div className="field-row">
               <input
@@ -619,7 +619,7 @@ export default function EvidenceBoard({ onComplete, isCompleted, trackCState }) 
                 type="text"
                 value={c3Answer}
                 onChange={(e) => setC3Answer(e.target.value)}
-                placeholder="e.g. CPU Cache, System RAM, Network Sockets"
+                placeholder="Enter your answer here..."
                 disabled={c3Solved || c3Locked || isCompleted}
               />
               <button

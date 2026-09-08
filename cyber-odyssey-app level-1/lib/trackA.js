@@ -65,7 +65,7 @@ const QUESTIONS = {
     prompt:
       "The header stack contains a fake bottom-most Received: line claiming an internal IP (10.0.0.1) injected by the sender to fool automated scanners. " +
       "Identify the TRUE first external internet IP address AND hostname that actually handed the message to the perimeter gateway.",
-    placeholder: "e.g. 203.0.113.77 / smtp-out.ithacah01dings.com",
+    placeholder: "Enter your answer here...",
     check: checkA1,
   },
   A2: {
@@ -75,7 +75,7 @@ const QUESTIONS = {
     prompt:
       "The email's link routes through a double-nested open redirect parameter (url=gateway.net?next=...). " +
       "Automated scanners stop at the intermediate gateway. What is the FINAL destination URL at the end of the entire redirect chain?",
-    placeholder: "e.g. https://ithacah01dings.com/verify",
+    placeholder: "Enter your answer here...",
     check: checkA2,
   },
   A3: {
@@ -85,7 +85,7 @@ const QUESTIONS = {
     prompt:
       "The envelope sender is set to smtp.mailfrom=sub.ithacah01dings.com while the visible sender is set to header.from=ithacaholdings.com. " +
       "Even under relaxed DMARC alignment, this fails. What is the EXACT legitimate organization domain listed in the visible header.from field?",
-    placeholder: "e.g. ithacaholdings.com",
+    placeholder: "Enter your answer here...",
     check: checkA3,
   },
   A4: {
@@ -95,7 +95,7 @@ const QUESTIONS = {
     prompt:
       "The email header block contains a hex-encoded ASCII SOC case reference string: '49482d534f432d33373139'. " +
       "Convert these hex byte values into plain text ASCII. What is the full SOC case reference string?",
-    placeholder: "e.g. IH-SOC-XXXX",
+    placeholder: "Enter your answer here...",
     check: checkA4,
   },
 };

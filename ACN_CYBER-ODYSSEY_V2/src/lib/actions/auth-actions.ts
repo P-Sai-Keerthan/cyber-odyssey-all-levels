@@ -1,6 +1,12 @@
 'use server';
 
 import { redirect } from 'next/navigation';
+import {
+  checkLoginAllowed,
+  getClientAddress,
+  recordLoginFailure,
+  recordLoginSuccess,
+} from '@/lib/auth/login-rate-limit';
 import { prisma } from '@/lib/prisma';
 import { hashPassword, verifyPassword } from '@/lib/auth/password';
 import { createSession, destroySession } from '@/lib/auth/session';
@@ -192,6 +198,16 @@ export async function loginAction(
     return { success: false, fieldErrors: { password: 'Password is required.' } };
   }
 
+  // Throttle BEFORE touching the database or a password hash. Verification is
+  // deliberately expensive, so admitting a blocked caller to it would turn the
+  // limiter into a CPU amplifier. See lib/auth/login-rate-limit.ts for why the
+  // primary key is (address + identifier) rather than the address alone.
+  const address = await getClientAddress();
+  const throttle = checkLoginAllowed(address, identifier);
+  if (throttle.blocked) {
+    return { success: false, error: throttle.message };
+  }
+
   try {
     const isEmail = identifier.includes('@');
     const user = isEmail
@@ -205,6 +221,10 @@ export async function loginAction(
         });
 
     if (!user) {
+      // Counts. Without this an attacker sprays one password across hundreds of
+      // GUESSED usernames and never trips anything: no account exists, so the
+      // account lockout never sees it either.
+      recordLoginFailure(address, identifier);
       return { success: false, error: INVALID_CREDENTIALS_MESSAGE };
     }
 
@@ -233,6 +253,7 @@ export async function loginAction(
 
     const isPasswordValid = await verifyPassword(password, user.passwordHash);
     if (!isPasswordValid) {
+      recordLoginFailure(address, identifier);
       const failures = failuresBeforeThisAttempt + 1;
       const nowLocked = failures >= FAILED_LOGIN_THRESHOLD;
 
@@ -289,6 +310,11 @@ export async function loginAction(
           'Please contact an event marshal to have access restored.',
       };
     }
+
+    // The password was correct, so this caller is not a guesser: clear their
+    // rate-limit counter. A participant who mistyped twice before getting it
+    // right is never penalised for the tries before.
+    recordLoginSuccess(address, identifier);
 
     // Successful login or pending login: reset the failure counter and clear any expired lock.
     await prisma.user.update({

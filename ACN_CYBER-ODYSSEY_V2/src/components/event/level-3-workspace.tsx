@@ -71,10 +71,10 @@ const FALLBACK_SCORING: Level3ScoreSummary = {
   track2Released: false,
   availableDiscoveryPoints: 3500,
   reportPoints: 200,
-  responsePoints: 200,
-  evaluatedPoints: 400,
-  availableTotalPoints: 3900,
-  fullTotalPoints: 6900,
+  responsePoints: 0,
+  evaluatedPoints: 200,
+  availableTotalPoints: 3700,
+  fullTotalPoints: 6700,
   targetIp: null,
   criteriaConfigured: false,
 };
@@ -213,7 +213,7 @@ export function Level3Workspace({
   codename = 'THE TWELVE AXES',
   // Fallback only; every real render passes the configured figure. See
   // FALLBACK_SCORING for why this is a plausible number rather than a blank.
-  points = '3,900 PTS',
+  points = '3,700 PTS',
   windowOpen = true,
   evaluationScore = null,
   evaluationStatus = null,
