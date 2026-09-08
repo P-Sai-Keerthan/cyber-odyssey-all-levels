@@ -86,7 +86,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const password = String(req.body?.password || "");
+    const password = String(req.body?.password || "").trim();
     if (!password || !matches(password, configured)) {
       recordFailure("admin", key);
       return res.status(401).json({ error: "Wrong password." });
